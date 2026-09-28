@@ -1,0 +1,1819 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph;
+
+import java.io.File;
+import java.io.InputStream;
+import java.lang.module.ModuleReference;
+import java.net.URI;
+import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import io.github.classgraph.base.LogNode;
+import io.github.classgraph.base.internal.concurrency.InterruptionChecker;
+import io.github.classgraph.base.internal.filter.AcceptReject;
+import io.github.classgraph.base.internal.path.PathList;
+import io.github.classgraph.base.internal.path.PathSyntax;
+import io.github.classgraph.base.internal.utils.Assert;
+import io.github.classgraph.base.internal.utils.VersionFinder;
+import io.github.classgraph.classpath.ClassLoaderHandler;
+import io.github.classgraph.classpath.ModulePathInfo;
+import io.github.classgraph.classpath.internal.CallStackInfo;
+import io.github.classgraph.classpath.internal.ClasspathSpec;
+import io.github.classgraph.classpath.internal.ScanSourceSpec;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Uber-fast, ultra-lightweight Java classpath and module path scanner. Scans classfiles in the classpath and/or
+ * module path by parsing the classfile binary format directly rather than by using reflection.
+ *
+ * <p>
+ * Nothing is scanned until it is enabled, so at least one of the {@code enable} methods has to be called for
+ * anything to be found:
+ *
+ * <pre>
+ * new ClassGraph().enableNonSystemModules().enableClasspath().acceptPackages("com.xyz").scan()
+ * </pre>
+ *
+ * <p>
+ * The methods that say where to scan come in pairs: the method with no arguments enables the sources found in the
+ * current runtime environment ({@link #enableClasspath()}, {@link #enableSystemModules()},
+ * {@link #enableSystemModules()}, {@link #enableNonSystemModules()}), and the method that takes varargs enables
+ * exactly the sources it is given ({@link #enableClassLoaders(ClassLoader...)},
+ * {@link #enableModuleLayers(ModuleLayer...)}, {@link #enableClasspathEntries(Object...)}). Calling only the
+ * varargs method scans only what it names, which is how the environment's own sources are left out.
+ *
+ * <p>
+ * The classpath sources are scanned in the order they were enabled in, and the modules are scanned before all of
+ * them, since that is the order in which the JVM resolves a class. Narrow what is reached from an enabled source
+ * with {@link #ignoreParentClassLoaders()}, {@link #ignoreParentModuleLayers()}, {@link #disableJarScanning()} and
+ * {@link #disableDirScanning()}. After a scan, {@link ScanResult#getClasspathURIs()} and
+ * {@link ScanResult#getModuleReferences()} report exactly which classpath elements and modules were scanned.
+ *
+ * <p>
+ * The {@code accept} and {@code reject} methods only narrow what the {@code enable} methods enabled -- neither of
+ * them adds anything to the scan. {@code accept} says "don't scan everything that was enabled, but do scan this",
+ * and {@code reject} says "out of what you are scanning, ignore this". So {@code acceptPackages("com.xyz").scan()}
+ * on its own scans nothing, since no source of classes was enabled, and {@code acceptModules("java.base")} does not
+ * cause {@code java.base} to be scanned unless {@link #enableSystemModules()} was also called.
+ *
+ * <p>
+ * All configuration is explicit: no config method calls another config method for you. An option that is only read
+ * by another option therefore does nothing unless that other option is asked for too, so rather than silently
+ * ignoring it, the scan is refused with an {@link IllegalArgumentException} naming the method that is missing --
+ * for example {@code enableMethodInfo()} without {@link #enableClassInfo()}, or {@link #ignoreMethodVisibility()}
+ * without {@link #enableMethodInfo()}. The Javadoc of each such method says what it has to be called alongside.
+ *
+ * <p>
+ * Documentation: <a href= "https://github.com/classgraph/classgraph/wiki">
+ * https://github.com/classgraph/classgraph/wiki</a>
+ */
+public final class ClassGraph {
+    /** The scanning specification. */
+    ScanSpec scanSpec = new ScanSpec();
+
+    /**
+     * The places that classpath elements and modules are looked for. Held separately from the {@link ScanSpec}, so
+     * that a {@link ScanResult} cannot keep a classloader or a module layer alive (a {@link ScanResult} holds its
+     * {@link ScanSpec}, but never this).
+     */
+    final ScanSourceSpec scanSourceSpec = new ScanSourceSpec();
+
+    /**
+     * The default number of worker threads to use while scanning. This number gave the best results on a relatively
+     * modern laptop with SSD, while scanning a large classpath.
+     */
+    static final int DEFAULT_NUM_WORKER_THREADS = Math.max(
+            // Always scan with at least 2 threads
+            2, //
+            Math.min(
+                    // Top out at 16 threads: reading a zipfile stops getting faster somewhere below that on the
+                    // machines this was measured on, and past it the extra threads only contend for memory
+                    // bandwidth and for cores that the JVM's own GC and JIT threads also need. See the benchmarks
+                    // in classgraph-vfs/README.md.
+                    16, //
+                    (int) Math.ceil(
+                            // Num IO threads (top out at 4, since most I/O devices won't scale better than this)
+                            Math.min(4.0, Runtime.getRuntime().availableProcessors() * 0.75) +
+                            // Num scanning threads (higher than available processors, because some threads can be
+                            // blocked)
+                                    Runtime.getRuntime().availableProcessors() * 1.25)) //
+    );
+
+    /**
+     * The default maximum length of time to wait for a worker thread to finish. This is long enough that a healthy
+     * scan will never hit it, but short enough that a scan that can never finish is reported rather than hanging
+     * forever.
+     */
+    static final Duration DEFAULT_WORKER_TIMEOUT = Duration.ofMinutes(1);
+
+    /** The Maven {@code groupId} of the artifact this class is packaged in. */
+    private static final String MAVEN_GROUP_ID = "io.github.classgraph";
+
+    /** The Maven {@code artifactId} of the artifact this class is packaged in. */
+    private static final String MAVEN_ARTIFACT_ID = "classgraph";
+
+    /**
+     * If non-null, log while scanning.
+     */
+    private @Nullable LogNode topLevelLog;
+
+    /**
+     * True if {@link #enableRealtimeLogging()} was called on this instance. {@link LogNode#logInRealtime(boolean)}
+     * sets a static flag, which cannot say whether it was this instance that asked for realtime logging, so record
+     * that here, in order to check at scan time that {@link #verbose()} was called too.
+     */
+    private boolean realtimeLoggingEnabled;
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Construct a ClassGraph instance.
+     *
+     * <p>
+     * A scan reads whatever the classpath names, and a classpath is not always something the caller wrote, so the
+     * URL schemes that every JVM can fetch over a network are denied to begin with: a jarfile is not downloaded
+     * from an {@code http:}, {@code https:}, {@code ftp:} or {@code mailto:} URL unless
+     * {@link #allowURLScheme(String)} or {@link #enableRemoteJarScanning()} asks for it. Every other scheme is read
+     * as found, including one that an application registered a {@link java.net.URLStreamHandler} or a
+     * {@link java.nio.file.spi.FileSystemProvider} for, since registering one is what says those URLs are meant to
+     * be read.
+     */
+    public ClassGraph() {
+        for (final String scheme : ClasspathSpec.NETWORK_URL_SCHEMES) {
+            scanSpec.vfsSpec.denyURLScheme(scheme);
+        }
+    }
+
+    /**
+     * Get the version number of ClassGraph.
+     *
+     * @return the ClassGraph version, or "unknown" if it could not be determined.
+     */
+    public static String getVersion() {
+        return VersionFinder.getVersion(ClassGraph.class, MAVEN_GROUP_ID, MAVEN_ARTIFACT_ID);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Switches on verbose logging to System.err.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph verbose() {
+        if (topLevelLog == null) {
+            topLevelLog = new LogNode();
+        }
+        return this;
+    }
+
+    /**
+     * Switches on verbose logging to System.err if verbose is true.
+     *
+     * @param verbose
+     *            if true, enable verbose logging.
+     * @return this (for method chaining).
+     */
+    public ClassGraph verbose(final boolean verbose) {
+        if (verbose && topLevelLog == null) {
+            topLevelLog = new LogNode();
+        }
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Enables the scanning of classfiles, producing {@link ClassInfo} objects in the {@link ScanResult}.
+     *
+     * <p>
+     * This says what is recorded about the classfiles that are scanned; it does not enable a source of classfiles.
+     * Call {@link #enableClasspath()}, {@link #enableSystemModules()} or one of the other {@code enable} methods
+     * that say where to scan.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableClassInfo() {
+        scanSpec.enableClassInfo = true;
+        return this;
+    }
+
+    /**
+     * Causes class visibility to be ignored, enabling private, package-private and protected classes to be scanned.
+     * By default, only public classes are scanned.
+     *
+     * <p>
+     * This has no effect unless {@link #enableClassInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph ignoreClassVisibility() {
+        scanSpec.ignoreClassVisibility = true;
+        return this;
+    }
+
+    /**
+     * Enables the saving of method info during the scan. This information can be obtained using
+     * {@link ClassInfo#getMethodInfo()} etc. By default, method info is not scanned.
+     *
+     * <p>
+     * This has no effect unless {@link #enableClassInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableMethodInfo() {
+        scanSpec.enableMethodInfo = true;
+        return this;
+    }
+
+    /**
+     * Causes method visibility to be ignored, enabling private, package-private and protected methods to be
+     * scanned. By default, only public methods are scanned.
+     *
+     * <p>
+     * This has no effect unless {@link #enableMethodInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph ignoreMethodVisibility() {
+        scanSpec.ignoreMethodVisibility = true;
+        return this;
+    }
+
+    /**
+     * Enables the saving of field info during the scan. This information can be obtained using
+     * {@link ClassInfo#getFieldInfo()}. By default, field info is not scanned.
+     *
+     * <p>
+     * This has no effect unless {@link #enableClassInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableFieldInfo() {
+        scanSpec.enableFieldInfo = true;
+        return this;
+    }
+
+    /**
+     * Causes field visibility to be ignored, enabling private, package-private and protected fields to be scanned.
+     * By default, only public fields are scanned.
+     *
+     * <p>
+     * This has no effect unless {@link #enableFieldInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph ignoreFieldVisibility() {
+        scanSpec.ignoreFieldVisibility = true;
+        return this;
+    }
+
+    /**
+     * Enables the saving of static final field constant initializer values. By default, constant initializer values
+     * are not scanned. If this is enabled, you can obtain the constant field initializer values from
+     * {@link FieldInfo#getConstantInitializerValue()}.
+     *
+     * <p>
+     * Note that constant initializer values are usually only of primitive type, or String constants (or values that
+     * can be computed and reduced to one of those types at compiletime).
+     *
+     * <p>
+     * Also note that it is up to the compiler as to whether or not a constant-valued field is assigned as a
+     * constant in the field definition itself, or whether it is assigned manually in static class initializer
+     * blocks -- so your mileage may vary in being able to extract constant initializer values.
+     *
+     * <p>
+     * Despite the name of this method, the constant initializer value of a non-static field is also returned, if
+     * the classfile stores one. javac stores one for a final instance field with a constant initializer (e.g.
+     * {@code final int x = 5;}), and the Kotlin compiler stores them even for non-final fields. The classfile spec
+     * says the JVM must ignore the constant initializer value of a non-static field, so a compiler could stop
+     * storing these values at any time, and you probably shouldn't rely on them. (javac does not store constant
+     * initializer values for non-final fields, even if they are static.)
+     *
+     * <p>
+     * This has no effect unless {@link #enableFieldInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableStaticFinalFieldConstantInitializerValues() {
+        scanSpec.enableStaticFinalFieldConstantInitializerValues = true;
+        return this;
+    }
+
+    /**
+     * Enables the saving of annotation info (for class, field, method and method parameter annotations) during the
+     * scan. This information can be obtained using {@link ClassInfo#getAllAnnotationInfo()},
+     * {@link FieldInfo#getAllAnnotationInfo()}, and {@link MethodParameterInfo#getAllAnnotationInfo()}. By default,
+     * annotation info is not scanned.
+     *
+     * <p>
+     * This has no effect unless {@link #enableClassInfo()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableAnnotationInfo() {
+        scanSpec.enableAnnotationInfo = true;
+        return this;
+    }
+
+    /**
+     * Enables the determination of inter-class dependencies, which may be read by calling
+     * {@link ClassInfo#getClassDependencies()}, {@link ScanResult#getClassDependencyMap()} or
+     * {@link ScanResult#getReverseClassDependencyMap()}.
+     *
+     * <p>
+     * This has no effect unless {@link #enableClassInfo()} is also called.
+     *
+     * <p>
+     * Only the dependencies that are recorded by the other options are found, so to see the dependencies of a
+     * class' fields, methods and annotations, call {@link #enableFieldInfo()}, {@link #enableMethodInfo()} and
+     * {@link #enableAnnotationInfo()} too; and to see the dependencies of its non-public classes, fields and
+     * methods, call {@link #ignoreClassVisibility()}, {@link #ignoreFieldVisibility()} and
+     * {@link #ignoreMethodVisibility()} as well.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableInterClassDependencies() {
+        scanSpec.enableInterClassDependencies = true;
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Causes only runtime visible annotations to be scanned (causes runtime invisible annotations to be ignored).
+     *
+     * <p>
+     * This narrows what is scanned; it does not enable the scanning of annotations. Call
+     * {@link #enableAnnotationInfo()} to scan annotations in the first place.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph disableRuntimeInvisibleAnnotations() {
+        scanSpec.disableRuntimeInvisibleAnnotations = true;
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Disables the scanning of jarfiles.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph disableJarScanning() {
+        scanSpec.scanJars = false;
+        return this;
+    }
+
+    /**
+     * Disables the scanning of nested jarfiles (jarfiles within jarfiles).
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph disableNestedJarScanning() {
+        scanSpec.vfsSpec.disableNestedJars();
+        return this;
+    }
+
+    /**
+     * Disables the scanning of directories.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph disableDirScanning() {
+        scanSpec.scanDirs = false;
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Causes ClassGraph to return the external classes: the classes that were not accepted for scanning, but that
+     * were read anyway, because an accepted class refers to them as a superclass, implemented interface or
+     * annotation.
+     *
+     * <p>
+     * This has no effect unless {@link #enableClassInfo()} is also called.
+     *
+     * <p>
+     * Scanning is always extended upwards from an accepted class in this way, so that the part of the class graph
+     * above an accepted class is complete, whether or not this method is called. What this method changes is only
+     * whether the external classes are reported: without it, an external class is left out of
+     * {@link ScanResult#getAllClasses()}, and out of the result of any query, including the "upward" queries such
+     * as {@link ClassInfo#getSuperclass()}, {@link ClassInfo#getAllSuperinterfaces()} and
+     * {@link ClassInfo#getAllAnnotations()}. (The predicates that report the class hierarchy as the JVM sees it,
+     * such as {@link ClassInfo#extendsSuperclass(String)}, {@link ClassInfo#implementsInterface(String)} and
+     * {@link ClassInfo#hasAnnotation(String)}, still take the external classes into account.)
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableExternalClasses() {
+        scanSpec.enableExternalClasses = true;
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Scan every classpath element of every ClassLoader that can be found in the current runtime environment.
+     *
+     * <p>
+     * A ClassLoader is found if it is any of the following:
+     *
+     * <ul>
+     * <li>the context ClassLoader of the calling thread, as returned by {@link Thread#getContextClassLoader()
+     * Thread.currentThread().getContextClassLoader()};</li>
+     * <li>the ClassLoader that loaded ClassGraph itself;</li>
+     * <li>the system ClassLoader, as returned by {@link ClassLoader#getSystemClassLoader()} -- this is the
+     * application ClassLoader, unless the JVM was launched with {@code -Djava.system.class.loader};</li>
+     * <li>the ClassLoader of the class in any frame of the current call stack, so that the ClassLoader of the code
+     * that called ClassGraph is scanned even when it is none of the above; or</li>
+     * <li>an ancestor of any of those, reached through {@link ClassLoader#getParent()}.</li>
+     * </ul>
+     *
+     * <p>
+     * Every classpath element that every one of those ClassLoaders loads classes from is scanned, whether or not
+     * the ClassLoader exposes it publicly -- see
+     * <a href="https://github.com/classgraph/classgraph/wiki/Classpath-Specification-Mechanisms">Classpath
+     * specification mechanisms</a> for how each supported ClassLoader is read. Classpath elements are scanned in
+     * the order in which the ClassLoaders that declared them would be asked to load a class, so a class that
+     * appears on the classpath more than once is reported from the copy the JVM would actually load. Each classpath
+     * element is scanned only once, however many of the ClassLoaders declare it.
+     *
+     * <p>
+     * The application ClassLoader is normally one of them, so its own classpath entries -- the ones that the
+     * {@code java.class.path} system property lists -- are scanned too, at the position the application ClassLoader
+     * takes in that order.
+     *
+     * <p>
+     * The application ClassLoader is one of the JPMS builtin ClassLoaders, and none of those exposes the locations
+     * it loads from through any public API, so its classpath entries are read from its private
+     * {@code jdk.internal.loader.URLClassPath ucp} field where that is possible, and from the
+     * {@code java.class.path} system property otherwise. The {@code jdk.internal.loader} package is exported to
+     * only three modules and is never opened, so the field can be read only if
+     * <a href="https://github.com/toolfactory/narcissus">Narcissus</a> is on the classpath, or the JVM was launched
+     * with {@code --add-opens java.base/jdk.internal.loader=ALL-UNNAMED}. Two kinds of classpath entry are
+     * therefore missed when the field cannot be read, since neither is listed in any system property the
+     * application can read:
+     * <ul>
+     * <li>the jars a Java agent appended by calling
+     * {@code Instrumentation.appendToSystemClassLoaderSearch(JarFile)}, which is specified not to change the value
+     * of {@code java.class.path}; and</li>
+     * <li>the entries appended to the boot classpath with {@code -Xbootclasspath/a}, or with the
+     * {@code Boot-Class-Path} attribute of a Java agent's manifest, which the bootstrap ClassLoader holds in a
+     * {@code URLClassPath} of its own.</li>
+     * </ul>
+     *
+     * <p>
+     * This method takes no arguments, because it scans what is in the environment. To scan specific ClassLoaders or
+     * specific classpath elements instead, call {@link #enableClassLoaders(ClassLoader...)} or
+     * {@link #enableClasspathEntries(Object...)} and do not call this method. Calling both scans the environment as
+     * well as what you named.
+     *
+     * <p>
+     * This method does not enable the scanning of modules. Classes in modules are reached by
+     * {@link #enableSystemModules()}, {@link #enableNonSystemModules()} or
+     * {@link #enableModuleLayers(ModuleLayer...)}, and modules are always scanned before the classpath.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableClasspath() {
+        scanSourceSpec.enableClasspath();
+        return this;
+    }
+
+    /**
+     * Scan the classpath elements declared by the given ClassLoaders, and by their parents, rather than by the
+     * ClassLoaders found in the current runtime environment. Call {@link #enableClasspath()} as well to scan both.
+     *
+     * <p>
+     * You may want to use this together with {@link #ignoreParentClassLoaders()}, so that classpath entries are
+     * obtained only from the ClassLoaders you passed in, and not from their parent ClassLoaders.
+     *
+     * <p>
+     * The JDK's own application and platform ClassLoaders do not expose the locations they load classes from, so
+     * they cannot be scanned as ClassLoaders. The application ClassLoader's own classpath entries are still found,
+     * since its handler falls back to the {@code java.class.path} system property, but the platform ClassLoader
+     * loads only from the system modules, so {@link #enableSystemModules()} is what reaches its classes.
+     *
+     * @param classLoaders
+     *            The ClassLoaders to scan.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if no ClassLoader is given.
+     */
+    public ClassGraph enableClassLoaders(final ClassLoader... classLoaders) {
+        scanSourceSpec.enableClassLoaders(classLoaders);
+        return this;
+    }
+
+    /**
+     * Scan the given classpath, with path elements separated by {@link java.io.File#pathSeparatorChar}. No
+     * ClassLoader is asked for it, so nothing else is scanned unless it is enabled as well.
+     *
+     * @param classpath
+     *            The classpath to scan, with path elements separated by {@link java.io.File#pathSeparatorChar}.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if {@code classpath} is empty.
+     */
+    public ClassGraph enableClasspathEntries(final String classpath) {
+        Assert.notNull(classpath, "classpath");
+        scanSourceSpec.enableClasspathString(classpath);
+        return this;
+    }
+
+    /**
+     * Scan the given classpath entries. No ClassLoader is asked for them, so nothing else is scanned unless it is
+     * enabled as well.
+     *
+     * <p>
+     * Works for Iterables of any type whose toString() method resolves to a classpath element string, e.g. String,
+     * File or Path. Each element is one classpath entry, and is not split on {@link java.io.File#pathSeparatorChar}
+     * -- pass the {@link String} overload for a path that needs splitting.
+     *
+     * <p>
+     * A single {@link Path} is treated as one classpath entry, not as a sequence of its name elements.
+     *
+     * @param classpathElements
+     *            The classpath entries to scan, one entry per element.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if {@code classpathElements} is empty, or if any element is a {@link ClassLoader} (pass those to
+     *             {@link #enableClassLoaders(ClassLoader...)} instead).
+     */
+    public ClassGraph enableClasspathEntries(final Iterable<?> classpathElements) {
+        Assert.notNull(classpathElements, "classpathElements");
+        if (classpathElements instanceof Path) {
+            // A Path is an Iterable of its own name elements, so passing a single Path binds to this overload
+            // rather than to the Object... overload. The name elements of a path are never classpath entries in
+            // their own right, so a Path is added as a single classpath entry.
+            scanSourceSpec.enableClasspathEntries(List.of(classpathElements));
+            return this;
+        }
+        final List<Object> classpathElementList = new ArrayList<>();
+        for (final Object classpathElement : classpathElements) {
+            classpathElementList.add(classpathElement);
+        }
+        scanSourceSpec.enableClasspathEntries(classpathElementList);
+        return this;
+    }
+
+    /**
+     * Scan the given classpath entries. No ClassLoader is asked for them, so nothing else is scanned unless it is
+     * enabled as well.
+     *
+     * <p>
+     * Works for arrays of any member type whose toString() method resolves to a classpath element string, e.g.
+     * String, File or Path. Each element is one classpath entry, and is not split on
+     * {@link java.io.File#pathSeparatorChar} -- pass the {@link String} overload for a path that needs splitting.
+     *
+     * @param classpathElements
+     *            The classpath entries to scan, one entry per element.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if {@code classpathElements} is empty, or if any element is a {@link ClassLoader} (pass those to
+     *             {@link #enableClassLoaders(ClassLoader...)} instead).
+     */
+    public ClassGraph enableClasspathEntries(final Object... classpathElements) {
+        Assert.notNullElements(classpathElements, "classpathElements");
+        scanSourceSpec.enableClasspathEntries(List.of(classpathElements));
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Add a classpath element filter. The provided filter should return true if the path string passed to it is a
+     * path you want to scan. If several filters are added, a classpath element is only scanned if every filter
+     * accepts it.
+     *
+     * @param classpathElementFilter
+     *            The filter to apply to the path string of each discovered classpath element. The path string is
+     *            normalized so that the path separator is '/'. It will usually be a file path, but could be a URL,
+     *            or it could be a path for a nested jar, where the jarfile is separated from the path within it by
+     *            "!/", as the "jar:" URL scheme requires. "jar:" and/or "file:" will have been stripped from the
+     *            beginning, if they were present in the classpath.
+     * @return this (for method chaining).
+     */
+    public ClassGraph filterClasspathElements(final Predicate<String> classpathElementFilter) {
+        Assert.notNull(classpathElementFilter, "classpathElementFilter");
+        scanSpec.classpathSpec.filterClasspathElements(classpathElementFilter);
+        return this;
+    }
+
+    /**
+     * Add a classpath element {@link URL} filter. The provided filter should return true if the {@link URL} passed
+     * to it is a URL you want to scan. If several filters are added, a classpath element is only scanned if every
+     * filter accepts it.
+     *
+     * @param classpathElementURLFilter
+     *            The filter to apply to the {@link URL} of each discovered classpath element.
+     * @return this (for method chaining).
+     */
+    public ClassGraph filterClasspathElementsByURL(final Predicate<URL> classpathElementURLFilter) {
+        Assert.notNull(classpathElementURLFilter, "classpathElementURLFilter");
+        scanSpec.classpathSpec.filterClasspathElementsByURL(classpathElementURLFilter);
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Ignore parent classloaders (i.e. only obtain paths to scan from classloaders that are not the parent of
+     * another classloader).
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph ignoreParentClassLoaders() {
+        scanSpec.classpathSpec.ignoreParentClassLoaders();
+        return this;
+    }
+
+    /**
+     * Register a {@link ClassLoaderHandler}, which teaches ClassGraph how to read the classpath out of a
+     * {@link ClassLoader} that it does not already know about.
+     *
+     * <p>
+     * ClassGraph ships with handlers for the classloaders of the common application servers, build tools and
+     * frameworks, so this is only needed for a classloader that none of those handle. Registered handlers are
+     * offered each classloader before the built-in handlers are, in the order they were registered, and are never
+     * dropped, so a registered handler can also override a built-in one. Of the built-in handlers, only those that
+     * name the most specific classloader class are used, so a handler for a subclass of
+     * {@link java.net.URLClassLoader} takes the place of the built-in {@code URLClassLoader} handler rather than
+     * running alongside it, and has to add the classloader's own URLs itself. A classloader or classpath entry that
+     * has already been placed keeps the position the first handler to place it gave it.
+     *
+     * @param classLoaderHandler
+     *            the {@link ClassLoaderHandler} to register.
+     * @return this (for method chaining).
+     */
+    public ClassGraph registerClassLoaderHandler(final ClassLoaderHandler classLoaderHandler) {
+        scanSpec.classpathSpec.addClassLoaderHandler(classLoaderHandler);
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Scan the modules supplied by the running JVM, as identified by
+     * {@link java.lang.module.ModuleFinder#ofSystem()}, in the ModuleLayers that are visible from the caller: the
+     * layers of the classes on the call stack, and the boot layer. If {@link #enableModuleLayers(ModuleLayer...)}
+     * named the layers to scan, the system modules of those layers are scanned instead.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableSystemModules() {
+        scanSourceSpec.enableModuleScanning();
+        scanSpec.classpathSpec.enableSystemModules();
+        return this;
+    }
+
+    /**
+     * Scan the non-system modules of the ModuleLayers that are visible from the caller: the layers of the classes
+     * on the call stack, and the boot layer. If {@link #enableModuleLayers(ModuleLayer...)} named the layers to
+     * scan, the non-system modules of those layers are scanned instead.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableNonSystemModules() {
+        scanSourceSpec.enableModuleScanning();
+        scanSpec.classpathSpec.enableNonSystemModules();
+        return this;
+    }
+
+    /**
+     * Scan the non-system modules of the given ModuleLayers, and of their parent layers, rather than of the
+     * ModuleLayers that are visible from the caller. Use this method if you define your own ModuleLayer, but the
+     * scanning code is not running within it.
+     *
+     * <p>
+     * The given layers replace the ones that are visible from the caller, rather than adding to them, so
+     * {@link #enableSystemModules()} and {@link #enableNonSystemModules()} apply to the given layers. Call
+     * {@link #enableDetectedModuleLayers()} as well to scan both.
+     *
+     * <p>
+     * This says which layers the modules are looked for in; it does not enable a kind of module, so it has no
+     * effect unless {@link #enableSystemModules()} or {@link #enableNonSystemModules()} is also called.
+     *
+     * @param moduleLayers
+     *            The ModuleLayers to scan.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if no ModuleLayer is given.
+     */
+    public ClassGraph enableModuleLayers(final ModuleLayer... moduleLayers) {
+        scanSourceSpec.enableModuleLayers(moduleLayers);
+        return this;
+    }
+
+    /**
+     * Scan the ModuleLayers that are visible from the caller -- the layers of the classes on the call stack, and
+     * the boot layer -- as well as any layers named by {@link #enableModuleLayers(ModuleLayer...)}.
+     *
+     * <p>
+     * These layers are searched anyway when a kind of module is enabled and no layer is named, so this is only
+     * needed alongside {@link #enableModuleLayers(ModuleLayer...)}, to scan a layer of your own without giving up
+     * the layers you can already see.
+     *
+     * <p>
+     * This says which layers the modules are looked for in; it does not enable a kind of module, so it has no
+     * effect unless {@link #enableSystemModules()} or {@link #enableNonSystemModules()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableDetectedModuleLayers() {
+        scanSourceSpec.enableDetectedModuleLayers();
+        return this;
+    }
+
+    /**
+     * Ignore parent module layers (i.e. only scan module layers that are not the parent of another module layer).
+     *
+     * <p>
+     * This has no effect unless {@link #enableSystemModules()} or {@link #enableNonSystemModules()} is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph ignoreParentModuleLayers() {
+        scanSpec.classpathSpec.ignoreParentModuleLayers();
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Scan one or more specific packages and their sub-packages.
+     *
+     * <p>
+     * This narrows what is scanned to the named packages; it does not enable a source of classes. Call
+     * {@link #enableClasspath()}, {@link #enableSystemModules()} or one of the other {@code enable} methods to say
+     * where the classes are looked for in the first place.
+     *
+     * <p>
+     * A package name is another way of writing a directory path, so this is the same filter as
+     * {@link #acceptPaths(String...)} applied to the same directories, and like it, it does not enable the reading
+     * of class information: without {@link #enableClassInfo()}, the accepted packages are scanned for resources
+     * only.
+     *
+     * @param packageNames
+     *            The fully-qualified names of packages to scan (using '.' as a separator). May include glob
+     *            wildcards: {@code '*'} matches within a single package segment only, and {@code "**"}, used as a
+     *            complete segment, matches zero or more package segments, e.g. {@code "com.**.internal"} matches
+     *            {@code com.internal}, {@code com.a.internal} and {@code com.a.b.internal}. Any number of wildcards
+     *            may be used, e.g. {@code "com.*.internal.*"}. Sub-packages of a matched package are also scanned,
+     *            so a trailing {@code ".**"} is accepted but redundant. Note that a {@code '*'} wildcard must match
+     *            at least one package segment, so {@code "java.awt.*"} matches the sub-packages of {@code java.awt}
+     *            but not {@code java.awt} itself -- to scan {@code java.awt} and everything below it, use
+     *            {@code "java.awt"}.
+     * @return this (for method chaining).
+     */
+    public ClassGraph acceptPackages(final String... packageNames) {
+        Assert.notNullElements(packageNames, "packageNames");
+        for (final String packageName : packageNames) {
+            // A trailing "**" means "and everything below", which acceptPackages() already does -- strip it
+            final var packageNameNormalized = AcceptReject
+                    .stripTrailingDoubleGlob(AcceptReject.normalizePackageOrClassName(packageName), '.');
+            // Accept package
+            scanSpec.packageAcceptReject.addToAccept(packageNameNormalized);
+            final var path = ClassNames.packageNameToPath(packageNameNormalized);
+            scanSpec.pathAcceptReject.addToAccept(path + "/");
+            if (packageNameNormalized.isEmpty()) {
+                scanSpec.pathAcceptReject.addToAccept("");
+            }
+            // Accept sub-packages (glob-containing package names included, since the prefix matcher can hold a glob
+            // -- #870)
+            if (packageNameNormalized.isEmpty()) {
+                scanSpec.packagePrefixAcceptReject.addToAccept("");
+                scanSpec.pathPrefixAcceptReject.addToAccept("");
+            } else {
+                scanSpec.packagePrefixAcceptReject.addToAccept(packageNameNormalized + ".");
+                scanSpec.pathPrefixAcceptReject.addToAccept(path + "/");
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Scan one or more specific paths, and their sub-directories or nested paths.
+     *
+     * <p>
+     * This narrows what is scanned to the named paths; it does not enable a source of resources. Call
+     * {@link #enableClasspath()}, {@link #enableSystemModules()} or one of the other {@code enable} methods to say
+     * where the resources are looked for in the first place.
+     *
+     * @param paths
+     *            The paths to scan, relative to the package root of the classpath element (with '/' as a
+     *            separator). May include glob wildcards: {@code '*'} matches within a single path segment only, and
+     *            {@code "**"}, used as a complete segment, matches zero or more whole path segments. Any number of
+     *            wildcards may be used. Sub-directories of a matched path are also scanned, so a trailing
+     *            {@code "/**"} is accepted but redundant.
+     * @return this (for method chaining).
+     */
+    public ClassGraph acceptPaths(final String... paths) {
+        Assert.notNullElements(paths, "paths");
+        for (final String path : paths) {
+            // A trailing "**" means "and everything below", which acceptPaths() already does -- strip it
+            final var pathNormalized = AcceptReject.stripTrailingDoubleGlob(AcceptReject.normalizePath(path), '/');
+            // Accept path
+            final var packageName = AcceptReject.pathToPackageName(pathNormalized);
+            scanSpec.packageAcceptReject.addToAccept(packageName);
+            scanSpec.pathAcceptReject.addToAccept(pathNormalized + "/");
+            if (pathNormalized.isEmpty()) {
+                scanSpec.pathAcceptReject.addToAccept("");
+            }
+            // Accept sub-directories / nested paths (glob-containing paths included -- #870)
+            if (pathNormalized.isEmpty()) {
+                scanSpec.packagePrefixAcceptReject.addToAccept("");
+                scanSpec.pathPrefixAcceptReject.addToAccept("");
+            } else {
+                scanSpec.packagePrefixAcceptReject.addToAccept(packageName + ".");
+                scanSpec.pathPrefixAcceptReject.addToAccept(pathNormalized + "/");
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Scan one or more specific packages, without recursively scanning sub-packages unless they are themselves
+     * accepted.
+     *
+     * <p>
+     * This narrows what is scanned to the named packages; it does not enable a source of classes. Call
+     * {@link #enableClasspath()}, {@link #enableSystemModules()} or one of the other {@code enable} methods to say
+     * where the classes are looked for in the first place.
+     *
+     * <p>
+     * A package name is another way of writing a directory path, so this is the same filter as
+     * {@link #acceptPathsNonRecursive(String...)} applied to the same directories, and like it, it does not enable
+     * the reading of class information: without {@link #enableClassInfo()}, the accepted packages are scanned for
+     * resources only.
+     *
+     * <p>
+     * This may be particularly useful for scanning the package root ("") without recursively scanning everything in
+     * the jar, dir or module.
+     *
+     * @param packageNames
+     *            The fully-qualified names of packages to scan (with '.' as a separator). May not include a glob
+     *            wildcard.
+     *
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if any package name contains a glob wildcard.
+     */
+    public ClassGraph acceptPackagesNonRecursive(final String... packageNames) {
+        Assert.notNullElements(packageNames, "packageNames");
+        for (final String packageName : packageNames) {
+            final var packageNameNormalized = AcceptReject.normalizePackageOrClassName(packageName);
+            if (AcceptReject.containsWildcard(packageNameNormalized)) {
+                throw new IllegalArgumentException("Cannot use a glob wildcard here: " + packageNameNormalized);
+            }
+            // Accept package, but not sub-packages
+            scanSpec.packageAcceptReject.addToAccept(packageNameNormalized);
+            scanSpec.pathAcceptReject.addToAccept(ClassNames.packageNameToPath(packageNameNormalized) + "/");
+            if (packageNameNormalized.isEmpty()) {
+                scanSpec.pathAcceptReject.addToAccept("");
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Scan one or more specific paths, without recursively scanning sub-directories or nested paths unless they are
+     * themselves accepted.
+     *
+     * <p>
+     * This narrows what is scanned to the named paths; it does not enable a source of resources. Call
+     * {@link #enableClasspath()}, {@link #enableSystemModules()} or one of the other {@code enable} methods to say
+     * where the resources are looked for in the first place.
+     *
+     * <p>
+     * This may be particularly useful for scanning the package root ("") without recursively scanning everything in
+     * the jar, dir or module.
+     *
+     * @param paths
+     *            The paths to scan, relative to the package root of the classpath element (with '/' as a
+     *            separator). May not include a glob wildcard.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if any path contains a glob wildcard.
+     */
+    public ClassGraph acceptPathsNonRecursive(final String... paths) {
+        Assert.notNullElements(paths, "paths");
+        for (final String path : paths) {
+            final var pathNormalized = AcceptReject.normalizePath(path);
+            if (AcceptReject.containsWildcard(pathNormalized)) {
+                throw new IllegalArgumentException("Cannot use a glob wildcard here: " + pathNormalized);
+            }
+            // Accept path, but not sub-directories / nested paths
+            scanSpec.packageAcceptReject.addToAccept(AcceptReject.pathToPackageName(pathNormalized));
+            scanSpec.pathAcceptReject.addToAccept(pathNormalized + "/");
+            if (pathNormalized.isEmpty()) {
+                scanSpec.pathAcceptReject.addToAccept("");
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Prevent the scanning of one or more specific packages and their sub-packages.
+     *
+     * <p>
+     * This leaves the named packages out of what is being scanned; like the {@code accept} methods, it never adds
+     * anything to the scan.
+     *
+     * <p>
+     * A package name is another way of writing a directory path, so this is the same filter as
+     * {@link #rejectPaths(String...)} applied to the same directories, and like it, it does not enable the reading
+     * of class information: without {@link #enableClassInfo()}, the scan reads resources only.
+     *
+     * @param packageNames
+     *            The fully-qualified names of packages to reject (using '.' as a separator). May include glob
+     *            wildcards: {@code '*'} matches within a single package segment only, and {@code "**"}, used as a
+     *            complete segment, matches zero or more package segments, e.g. {@code "com.**.internal"} matches
+     *            {@code com.internal}, {@code com.a.internal} and {@code com.a.b.internal}. Any number of wildcards
+     *            may be used, e.g. {@code "com.*.internal.*"}. Sub-packages of a matched package are also rejected,
+     *            so a trailing {@code ".**"} is accepted but redundant. Note that a {@code '*'} wildcard must match
+     *            at least one package segment, so {@code "java.awt.*"} matches the sub-packages of {@code java.awt}
+     *            but not {@code java.awt} itself -- to reject {@code java.awt} and everything below it, use
+     *            {@code "java.awt"}.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if any package name is the root package ({@code ""}), which would reject everything, leaving
+     *             nothing to scan.
+     */
+    public ClassGraph rejectPackages(final String... packageNames) {
+        Assert.notNullElements(packageNames, "packageNames");
+        for (final String packageName : packageNames) {
+            final var packageNameNormalized = AcceptReject
+                    .stripTrailingDoubleGlob(AcceptReject.normalizePackageOrClassName(packageName), '.');
+            if (packageNameNormalized.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Rejecting the root package (\"\") will cause nothing to be scanned");
+            }
+            // Rejecting always prevents further recursion, no need to reject sub-packages
+            scanSpec.packageAcceptReject.addToReject(packageNameNormalized);
+            final var path = ClassNames.packageNameToPath(packageNameNormalized);
+            scanSpec.pathAcceptReject.addToReject(path + "/");
+            // Reject sub-packages (zipfile entries can occur in any order)
+            scanSpec.packagePrefixAcceptReject.addToReject(packageNameNormalized + ".");
+            scanSpec.pathPrefixAcceptReject.addToReject(path + "/");
+        }
+        return this;
+    }
+
+    /**
+     * Prevent the scanning of one or more specific paths and their sub-directories / nested paths.
+     *
+     * <p>
+     * This leaves the named paths out of what is being scanned; like the {@code accept} methods, it never adds
+     * anything to the scan.
+     *
+     * @param paths
+     *            The paths to reject (with '/' as a separator). May include glob wildcards: {@code '*'} matches
+     *            within a single path segment only, and {@code "**"}, used as a complete segment, matches zero or
+     *            more whole path segments. Any number of wildcards may be used. Sub-directories of a matched path
+     *            are also rejected, so a trailing {@code "/**"} is accepted but redundant.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if any path is the package root ({@code ""} or {@code "/"}), which would reject everything,
+     *             leaving nothing to scan.
+     */
+    public ClassGraph rejectPaths(final String... paths) {
+        Assert.notNullElements(paths, "paths");
+        for (final String path : paths) {
+            final var pathNormalized = AcceptReject.stripTrailingDoubleGlob(AcceptReject.normalizePath(path), '/');
+            if (pathNormalized.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Rejecting the root package (\"\") will cause nothing to be scanned");
+            }
+            // Rejecting always prevents further recursion, no need to reject sub-directories / nested paths
+            final var packageName = AcceptReject.pathToPackageName(pathNormalized);
+            scanSpec.packageAcceptReject.addToReject(packageName);
+            scanSpec.pathAcceptReject.addToReject(pathNormalized + "/");
+            // Reject sub-directories / nested paths
+            scanSpec.packagePrefixAcceptReject.addToReject(packageName + ".");
+            scanSpec.pathPrefixAcceptReject.addToReject(pathNormalized + "/");
+        }
+        return this;
+    }
+
+    /**
+     * Scan one or more specific classes, without scanning other classes in the same package unless the package is
+     * itself accepted.
+     *
+     * <p>
+     * This narrows what is scanned to the named classes; it does not enable a source of classes. Call
+     * {@link #enableClasspath()}, {@link #enableSystemModules()} or one of the other {@code enable} methods to say
+     * where the classes are looked for in the first place.
+     *
+     * <p>
+     * A class name is another way of writing a classfile path, so like {@link #acceptPaths(String...)}, this does
+     * not enable the reading of class information: without {@link #enableClassInfo()}, the accepted classes are
+     * scanned as resources only.
+     *
+     * @param classNames
+     *            The fully-qualified names of classes to scan (using '.' as a separator). May contain glob
+     *            wildcards, where {@code '*'} matches within a single package or class name segment, {@code "**"}
+     *            matches zero or more whole packages, and {@code '?'} matches one character. To match a class name
+     *            by glob in any package, you must include a package glob too, e.g. {@code "**.*Suffix"}.
+     * @return this (for method chaining).
+     */
+    public ClassGraph acceptClasses(final String... classNames) {
+        Assert.notNullElements(classNames, "classNames");
+        for (final String className : classNames) {
+            final var classNameNormalized = AcceptReject.normalizePackageOrClassName(className);
+            // Accept the class itself
+            scanSpec.classAcceptReject.addToAccept(classNameNormalized);
+            scanSpec.classfilePathAcceptReject
+                    .addToAccept(ClassNames.classNameToClassfilePath(classNameNormalized));
+            // A class name is never empty, so getParentPackageName cannot return null
+            final var packageName = Objects.requireNonNull(PackageInfo.getParentPackageName(classNameNormalized));
+            // Record the package containing the class, so we can recurse to this point even if the package is not
+            // itself accepted
+            scanSpec.classPackageAcceptReject.addToAccept(packageName);
+            scanSpec.classPackagePathAcceptReject.addToAccept(ClassNames.packageNameToPath(packageName) + "/");
+        }
+        return this;
+    }
+
+    /**
+     * Specifically reject one or more specific classes, preventing them from being scanned even if they are in a
+     * accepted package.
+     *
+     * <p>
+     * This leaves the named classes out of what is being scanned; like the {@code accept} methods, it never adds
+     * anything to the scan.
+     *
+     * <p>
+     * A class name is another way of writing a classfile path, so like {@link #rejectPaths(String...)}, this does
+     * not enable the reading of class information: without {@link #enableClassInfo()}, the scan reads resources
+     * only.
+     *
+     * @param classNames
+     *            The fully-qualified names of classes to reject (using '.' as a separator). May contain glob
+     *            wildcards, where {@code '*'} matches within a single package or class name segment, {@code "**"}
+     *            matches zero or more whole packages, and {@code '?'} matches one character. To match a class name
+     *            by glob in any package, you must include a package glob too, e.g. {@code "**.*Suffix"}.
+     * @return this (for method chaining).
+     */
+    public ClassGraph rejectClasses(final String... classNames) {
+        Assert.notNullElements(classNames, "classNames");
+        for (final String className : classNames) {
+            final var classNameNormalized = AcceptReject.normalizePackageOrClassName(className);
+            scanSpec.classAcceptReject.addToReject(classNameNormalized);
+            scanSpec.classfilePathAcceptReject
+                    .addToReject(ClassNames.classNameToClassfilePath(classNameNormalized));
+        }
+        return this;
+    }
+
+    /**
+     * Accept one or more jars. This will cause only the accepted jars to be scanned.
+     *
+     * <p>
+     * This narrows what is scanned to the named jars; it does not add a jar to the classpath. A jar is scanned only
+     * if it is also reached from a source that was enabled with {@link #enableClasspath()},
+     * {@link #enableClassLoaders(ClassLoader...)} or {@link #enableClasspathEntries(Object...)}.
+     *
+     * @param jarLeafNames
+     *            The leafnames of the jars that should be scanned (e.g. {@code "mylib.jar"}), matched ignoring
+     *            case. May contain glob wildcards, where {@code '*'} matches zero or more characters
+     *            ({@code "mylib-*.jar"}) and {@code '?'} matches one character.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if any name includes a directory component rather than being a bare leafname.
+     */
+    public ClassGraph acceptJars(final String... jarLeafNames) {
+        Assert.notNullElements(jarLeafNames, "jarLeafNames");
+        for (final String jarLeafName : jarLeafNames) {
+            final var leafName = PathSyntax.leafName(jarLeafName);
+            if (!leafName.equals(jarLeafName)) {
+                throw new IllegalArgumentException("Can only accept jars by leafname: " + jarLeafName);
+            }
+            scanSpec.jarAcceptReject.addToAccept(leafName);
+        }
+        return this;
+    }
+
+    /**
+     * Reject one or more jars, preventing them from being scanned.
+     *
+     * <p>
+     * This leaves the named jars out of what is being scanned; like the {@code accept} methods, it never adds
+     * anything to the scan.
+     *
+     * @param jarLeafNames
+     *            The leafnames of the jars that should not be scanned (e.g. {@code "badlib.jar"}), matched ignoring
+     *            case. May contain glob wildcards, where {@code '*'} matches zero or more characters
+     *            ({@code "badlib-*.jar"}) and {@code '?'} matches one character.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if any name includes a directory component rather than being a bare leafname.
+     */
+    public ClassGraph rejectJars(final String... jarLeafNames) {
+        Assert.notNullElements(jarLeafNames, "jarLeafNames");
+        for (final String jarLeafName : jarLeafNames) {
+            final var leafName = PathSyntax.leafName(jarLeafName);
+            if (!leafName.equals(jarLeafName)) {
+                throw new IllegalArgumentException("Can only reject jars by leafname: " + jarLeafName);
+            }
+            scanSpec.jarAcceptReject.addToReject(leafName);
+        }
+        return this;
+    }
+
+    /**
+     * Accept one or more modules for scanning. If any module is accepted, only the accepted modules are scanned
+     * (any jars and directories on the enabled classpath are still scanned, unless they are excluded by other
+     * criteria).
+     *
+     * <p>
+     * This narrows what is scanned; it does not enable the scanning of modules. Call
+     * {@link #enableSystemModules()}, {@link #enableNonSystemModules()} or
+     * {@link #enableModuleLayers(ModuleLayer...)} to say which modules are looked for in the first place.
+     *
+     * @param moduleNames
+     *            The names of the modules that should be scanned. May contain glob wildcards, where {@code '*'}
+     *            matches within a single module name segment, {@code "**"} matches zero or more whole segments
+     *            (e.g. {@code "jdk.**"} matches every module whose name starts with {@code "jdk."}), and
+     *            {@code '?'} matches one character.
+     * @return this (for method chaining).
+     */
+    // #658
+    public ClassGraph acceptModules(final String... moduleNames) {
+        Assert.notNullElements(moduleNames, "moduleNames");
+        for (final String moduleName : moduleNames) {
+            scanSpec.moduleAcceptReject.addToAccept(AcceptReject.normalizePackageOrClassName(moduleName));
+        }
+        return this;
+    }
+
+    /**
+     * Reject one or more modules, preventing them from being scanned.
+     *
+     * <p>
+     * This leaves the named modules out of what is being scanned; like the {@code accept} methods, it never adds
+     * anything to the scan.
+     *
+     * @param moduleNames
+     *            The names of the modules that should not be scanned. May contain glob wildcards, where {@code '*'}
+     *            matches within a single module name segment, {@code "**"} matches zero or more whole segments, and
+     *            {@code '?'} matches one character. Rejecting a system module leaves the other system modules
+     *            scannable, if {@link #enableSystemModules()} was called.
+     * @return this (for method chaining).
+     */
+    // #658
+    public ClassGraph rejectModules(final String... moduleNames) {
+        Assert.notNullElements(moduleNames, "moduleNames");
+        for (final String moduleName : moduleNames) {
+            scanSpec.moduleAcceptReject.addToReject(AcceptReject.normalizePackageOrClassName(moduleName));
+        }
+        return this;
+    }
+
+    /**
+     * Accept classpath elements based on resource paths. Only classpath elements that contain resources with paths
+     * matching the accept will be scanned.
+     *
+     * <p>
+     * This narrows what is scanned to the classpath elements that match; it does not add a classpath element to the
+     * scan.
+     *
+     * @param resourcePaths
+     *            The resource paths, any of which must be present in a classpath element for the classpath element
+     *            to be scanned. May contain glob wildcards, where {@code '*'} matches within a single path segment,
+     *            {@code "**"} matches zero or more whole path segments (e.g. {@code "META-INF/**"}), and
+     *            {@code '?'} matches one character.
+     * @return this (for method chaining).
+     */
+    public ClassGraph acceptClasspathElementsContainingResourcePath(final String... resourcePaths) {
+        Assert.notNullElements(resourcePaths, "resourcePaths");
+        for (final String resourcePath : resourcePaths) {
+            final var resourcePathNormalized = AcceptReject.normalizePath(resourcePath);
+            scanSpec.classpathElementResourcePathAcceptReject.addToAccept(resourcePathNormalized);
+        }
+        return this;
+    }
+
+    /**
+     * Reject classpath elements based on resource paths. Classpath elements that contain resources with paths
+     * matching the reject will not be scanned.
+     *
+     * <p>
+     * This leaves the matching classpath elements out of what is being scanned; like the {@code accept} methods, it
+     * never adds anything to the scan.
+     *
+     * @param resourcePaths
+     *            The resource paths which cause a classpath not to be scanned if any are present in a classpath
+     *            element for the classpath element. May contain glob wildcards, where {@code '*'} matches within a
+     *            single path segment, {@code "**"} matches zero or more whole path segments, and {@code '?'}
+     *            matches one character.
+     * @return this (for method chaining).
+     */
+    public ClassGraph rejectClasspathElementsContainingResourcePath(final String... resourcePaths) {
+        Assert.notNullElements(resourcePaths, "resourcePaths");
+        for (final String resourcePath : resourcePaths) {
+            final var resourcePathNormalized = AcceptReject.normalizePath(resourcePath);
+            scanSpec.classpathElementResourcePathAcceptReject.addToReject(resourcePathNormalized);
+        }
+        return this;
+    }
+
+    /**
+     * Enable classpath elements to be fetched from remote ({@code "http:"}/{@code "https:"}) URLs. Equivalent to:
+     *
+     * <p>
+     * {@code new ClassGraph().allowURLScheme("http").allowURLScheme("https");}
+     *
+     * <p>
+     * Scanning from http(s) URLs is disabled by default, as downloading and reading jars from a remote server may
+     * present a security vulnerability. A custom URL scheme does not have to be allowed -- see
+     * {@link #allowURLScheme(String)}.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableRemoteJarScanning() {
+        return allowURLScheme("http").allowURLScheme("https");
+    }
+
+    /**
+     * Allow classpath elements to be fetched from {@link URL} connections with the specified URL scheme.
+     *
+     * <p>
+     * Only {@code http}, {@code https}, {@code ftp} and {@code mailto} have to be allowed this way -- see
+     * {@link #ClassGraph()}. A scheme that the JVM can open only because an application registered a
+     * {@link java.net.URLStreamHandler} or a {@link java.nio.file.spi.FileSystemProvider} for it is already read as
+     * found. Naming one here is still worth doing if classpath elements with that scheme arrive in a
+     * {@code ':'}-separated classpath string such as {@code java.class.path}, since the scheme's own {@code ':'}
+     * would otherwise be read as a separator and split the path element in two.
+     *
+     * @param scheme
+     *            the URL scheme string, e.g. "resource" for a custom "resource:" URL scheme. The scheme name only,
+     *            without the trailing {@code ':'}.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if the scheme is shorter than two characters (a one-character scheme cannot be told apart from a
+     *             Windows drive letter), or is not a valid URL scheme.
+     */
+    public ClassGraph allowURLScheme(final String scheme) {
+        Assert.notNull(scheme, "scheme");
+        scanSpec.classpathSpec.allowURLScheme(scheme);
+        scanSpec.vfsSpec.allowURLScheme(scheme);
+        return this;
+    }
+
+    /**
+     * Refuse to fetch a jarfile from a classpath element named by a {@link URL} with the specified URL scheme. The
+     * classpath element is still reported, but the jarfile it names is not read, so neither its classes nor the
+     * classpath elements its manifest declares are found.
+     *
+     * <p>
+     * {@code http}, {@code https}, {@code ftp} and {@code mailto} are refused already -- see {@link #ClassGraph()}.
+     * This adds a scheme to those.
+     *
+     * @param scheme
+     *            the URL scheme string, e.g. "s3" for an "s3:" URL scheme. The scheme name only, without the
+     *            trailing {@code ':'}.
+     * @return this (for method chaining).
+     * @throws IllegalArgumentException
+     *             if the scheme is shorter than two characters (a one-character scheme cannot be told apart from a
+     *             Windows drive letter), or is not a valid URL scheme.
+     */
+    public ClassGraph denyURLScheme(final String scheme) {
+        Assert.notNull(scheme, "scheme");
+        scanSpec.vfsSpec.denyURLScheme(scheme);
+        return this;
+    }
+
+    /**
+     * Enables the scanning of the JRE's own {@code lib} and {@code ext} jars when they are found on the classpath.
+     * These are skipped by default for speed, since they hold the system classes of a pre-modular JRE.
+     *
+     * <p>
+     * This is about jars, not modules: call {@link #enableSystemModules()} to scan the system modules.
+     *
+     * <p>
+     * This adds the system jars to what is scanned; like the other methods that add to the scan, it does not enable
+     * the reading of class information. Call {@link #enableClassInfo()} for that; without it, the system jars are
+     * scanned for resources only.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableSystemJars() {
+        scanSpec.enableSystemJars = true;
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * The maximum size of an inner (nested) jar that has been deflated (i.e. compressed, not stored) within an
+     * outer jar, before it has to be spilled to disk rather than stored in a RAM-backed {@link ByteBuffer} when it
+     * is deflated, in order for the inner jar's entries to be read. (Note that this situation of having to deflate
+     * a nested jar to RAM or disk in order to read it is rare, because normally adding a jarfile to another jarfile
+     * will store the inner jar, rather than deflate it, because deflating a jarfile does not usually produce any
+     * further compression gains. If an inner jar is stored, not deflated, then its zip entries can be read directly
+     * using ClassGraph's own zipfile central directory parser, which can use file slicing to extract entries
+     * directly from stored nested jars.)
+     *
+     * <p>
+     * This is also the maximum size of a jar downloaded from an {@code http://} or {@code https://} classpath
+     * {@link URL} to RAM. Once this many bytes have been read from the {@link URL}'s {@link InputStream}, then the
+     * RAM contents are spilled over to a temporary file on disk, and the rest of the content is downloaded to the
+     * temporary file. (This is also rare, because normally there are no {@code http://} or {@code https://}
+     * classpath entries.)
+     *
+     * <p>
+     * Default: 64MB (i.e. writing to disk is avoided wherever possible). Setting a lower max RAM size value will
+     * decrease ClassGraph's memory usage if either of the above rare situations occurs.
+     *
+     * @param maxBufferedJarRAMSize
+     *            The max RAM size to use for deflated inner jars or downloaded jars. This is the limit per jar, not
+     *            for the whole classpath.
+     * @return this (for method chaining).
+     */
+    public ClassGraph setMaxBufferedJarRAMSize(final int maxBufferedJarRAMSize) {
+        scanSpec.vfsSpec.setMaxBufferedJarRAMSize(maxBufferedJarRAMSize);
+        return this;
+    }
+
+    /**
+     * Set the maximum length of time to wait for a worker thread to finish, once the calling thread has run out of
+     * work of its own to do. If a worker thread does not finish within this time, the scan throws
+     * {@link ClassGraphException} rather than blocking forever.
+     *
+     * <p>
+     * A worker thread that never finishes means the scan cannot complete. The two known causes are a classloading
+     * deadlock, where the calling thread holds a lock that the classloader needs in order to load one of
+     * ClassGraph's own classes on a worker thread (#933) -- which can be avoided by calling {@link #scan(int)} with
+     * a {@code numThreads} of 1, so that nothing is loaded on a worker thread -- and a worker thread blocking
+     * indefinitely on a filesystem or network read of a classpath element.
+     *
+     * <p>
+     * Default: 1 minute. Set a longer timeout if a scan of a very large or very slow classpath needs it. A timeout
+     * that is zero or negative disables the timeout, so that worker threads are waited for indefinitely.
+     *
+     * @param workerTimeout
+     *            the maximum length of time to wait for a worker thread to finish.
+     * @return this (for method chaining).
+     */
+    public ClassGraph setWorkerTimeout(final Duration workerTimeout) {
+        Assert.notNull(workerTimeout, "workerTimeout");
+        scanSpec.workerTimeout = workerTimeout;
+        return this;
+    }
+
+    /**
+     * Do not honor the multi-release versioning of a jarfile: report every version of a multi-release resource
+     * under the literal {@code META-INF/versions/<N>/} path it is stored under, rather than serving just the one
+     * version the running JVM would use, which is the default.
+     *
+     * <p>
+     * This shows a caller what a jarfile holds, rather than what the JVM would load out of it, so it is what a tool
+     * that inspects or repackages jarfiles wants. Anything that wants the classes and resources an application
+     * would actually run should leave multi-release versioning enabled.
+     *
+     * <p>
+     * Classfile scanning still works, and reports the same classes that a JVM too old to know about multi-release
+     * jarfiles would load: the versioned copies are stored beneath {@code META-INF/versions/<N>/}, and neither
+     * {@code META-INF} nor {@code <N>} can be a package name, so a classfile stored beneath one of them is not at a
+     * path any class could be loaded from, and is listed as a resource without being scanned as a classfile.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph disableMultiReleaseVersions() {
+        scanSpec.vfsSpec.disableMultiReleaseVersions();
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Sets the logger to "realtime logging mode", where log entries are written out immediately to stderr, rather
+     * than only after the scan has completed. Can help to identify problems where scanning is stuck in a loop, or
+     * where one scanning step is taking much longer than it should, etc.
+     *
+     * <p>
+     * This says when the log is written, not whether there is a log, so it has no effect unless {@link #verbose()}
+     * is also called.
+     *
+     * @return this (for method chaining).
+     */
+    public ClassGraph enableRealtimeLogging() {
+        realtimeLoggingEnabled = true;
+        LogNode.logInRealtime(true);
+        return this;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Scan the enabled classpath elements and modules using the requested {@link ExecutorService} and the requested
+     * degree of parallelism, blocking until the scan is complete. Nothing is scanned unless one of the
+     * {@code enable} methods was called. You should assign the returned {@link ScanResult} in a try-with-resources
+     * statement, or manually close it when you are finished with it.
+     *
+     * <p>
+     * The scan itself runs on the calling thread, and the {@link ExecutorService} is used only for the parallel
+     * stages of the scan, so passing a {@code numParallelTasks} of 1 loads every class the scan needs on the
+     * calling thread. That matters when the calling thread holds a lock that the classloader also acquires, since
+     * loading a class on any other thread would then deadlock (#933).
+     *
+     * @param executorService
+     *            A custom {@link ExecutorService} to use for scheduling worker tasks. This {@link ExecutorService}
+     *            should start tasks in FIFO order to avoid a deadlock during scan, i.e. be sure to construct the
+     *            {@link ExecutorService} with a {@link LinkedBlockingQueue} as its task queue. (This is the default
+     *            for {@link Executors#newFixedThreadPool(int)}.)
+     * @param numParallelTasks
+     *            The number of parallel tasks to break the work into during the most CPU-intensive stage of
+     *            classpath scanning. Must be at least 1. The calling thread is one of these tasks; ideally the
+     *            ExecutorService will have at least {@code numParallelTasks - 1} threads available.
+     * @return a {@link ScanResult} object representing the result of the scan.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if {@code numParallelTasks} is less than 1, or if a config option was enabled without the config
+     *             option that reads it.
+     */
+    public ScanResult scan(final ExecutorService executorService, final int numParallelTasks) {
+        Assert.notNull(executorService, "executorService");
+        checkNumParallelTasks(numParallelTasks);
+        return scanOnThisThread(/* performScan = */ true, executorService, numParallelTasks);
+    }
+
+    /**
+     * Validate the requested scan parallelism before scheduling any work.
+     *
+     * @param numParallelTasks
+     *            The requested number of parallel scan tasks.
+     */
+    private static void checkNumParallelTasks(final int numParallelTasks) {
+        if (numParallelTasks < 1) {
+            throw new IllegalArgumentException("numParallelTasks must be at least 1");
+        }
+    }
+
+    /**
+     * Check that every config option that is only read by another config option was asked for alongside that other
+     * option. No config method turns on another config method for you, so an option whose companion was not enabled
+     * would otherwise be silently ignored.
+     *
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the option that reads it.
+     */
+    private void checkConfigIsExplicit() {
+        final var moduleKindMethods = "enableSystemModules or enableNonSystemModules";
+        checkRequires(scanSpec.enableFieldInfo, "enableFieldInfo", scanSpec.enableClassInfo, "enableClassInfo");
+        checkRequires(scanSpec.enableMethodInfo, "enableMethodInfo", scanSpec.enableClassInfo, "enableClassInfo");
+        checkRequires(scanSpec.enableAnnotationInfo, "enableAnnotationInfo", scanSpec.enableClassInfo,
+                "enableClassInfo");
+        checkRequires(scanSpec.ignoreClassVisibility, "ignoreClassVisibility", scanSpec.enableClassInfo,
+                "enableClassInfo");
+        checkRequires(scanSpec.enableInterClassDependencies, "enableInterClassDependencies",
+                scanSpec.enableClassInfo, "enableClassInfo");
+        checkRequires(scanSpec.enableExternalClasses, "enableExternalClasses", scanSpec.enableClassInfo,
+                "enableClassInfo");
+        checkRequires(scanSpec.ignoreFieldVisibility, "ignoreFieldVisibility", scanSpec.enableFieldInfo,
+                "enableFieldInfo");
+        checkRequires(scanSpec.enableStaticFinalFieldConstantInitializerValues,
+                "enableStaticFinalFieldConstantInitializerValues", scanSpec.enableFieldInfo, "enableFieldInfo");
+        checkRequires(scanSpec.ignoreMethodVisibility, "ignoreMethodVisibility", scanSpec.enableMethodInfo,
+                "enableMethodInfo");
+        checkRequires(scanSpec.disableRuntimeInvisibleAnnotations, "disableRuntimeInvisibleAnnotations",
+                scanSpec.enableAnnotationInfo, "enableAnnotationInfo");
+        checkRequires(realtimeLoggingEnabled, "enableRealtimeLogging", topLevelLog != null, "verbose");
+        // The module layer methods say which layers to look in, so they need a kind of module to look for
+        checkRequires(scanSourceSpec.namedModuleLayers != null, "enableModuleLayers",
+                scanSourceSpec.moduleScanningEnabled, moduleKindMethods);
+        checkRequires(scanSourceSpec.searchDetectedModuleLayers, "enableDetectedModuleLayers",
+                scanSourceSpec.moduleScanningEnabled, moduleKindMethods);
+        checkRequires(scanSpec.classpathSpec.isParentModuleLayersIgnored(), "ignoreParentModuleLayers",
+                scanSourceSpec.moduleScanningEnabled, moduleKindMethods);
+    }
+
+    /**
+     * Throw if a config option was enabled without the option that reads it.
+     *
+     * @param enabled
+     *            true if the config option that needs a companion option was enabled.
+     * @param methodName
+     *            the name of the config method that needs a companion option.
+     * @param companionEnabled
+     *            true if the companion config option was enabled.
+     * @param companionMethodNames
+     *            the name of the companion config method, or several names separated by " or ".
+     * @throws IllegalArgumentException
+     *             if {@code enabled} is true and {@code companionEnabled} is false.
+     */
+    private static void checkRequires(final boolean enabled, final String methodName,
+            final boolean companionEnabled, final String companionMethodNames) {
+        if (enabled && !companionEnabled) {
+            final var companions = Arrays.stream(companionMethodNames.split(" or "))
+                    .map(name -> "ClassGraph#" + name + "()").collect(Collectors.joining(" or "));
+            throw new IllegalArgumentException(
+                    "ClassGraph#" + methodName + "() has no effect unless " + companions + " is also called");
+        }
+    }
+
+    /**
+     * Run a scan on the calling thread, blocking until it is complete.
+     *
+     * <p>
+     * The {@link Scanner} is run on the calling thread rather than being submitted to the {@link ExecutorService}
+     * and waited for. Submitting it would leave the calling thread blocked on a {@link Future} while the classes
+     * that the scanner touches were loaded on a worker thread, which deadlocks if the calling thread holds a lock
+     * that the classloader also acquires -- a classloader that locks during early startup is not unusual. Neither
+     * side of that cycle is a monitor that both threads contend for, so the JVM does not report it as a deadlock:
+     * the scan simply never returns (#933). The {@link ExecutorService} is still used for the parallel stages of
+     * the scan, and is not used at all when {@code numParallelTasks} is 1.
+     *
+     * @param performScan
+     *            If true, performing a scan. If false, only fetching the classpath.
+     * @param executorService
+     *            A custom {@link ExecutorService} to use for scheduling worker tasks.
+     * @param numParallelTasks
+     *            The number of parallel tasks to break the work into during the most CPU-intensive stage of
+     *            classpath scanning.
+     * @return a {@link ScanResult} object representing the result of the scan.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     */
+    private ScanResult scanOnThisThread(final boolean performScan, final ExecutorService executorService,
+            final int numParallelTasks) {
+        checkConfigIsExplicit();
+        // Read the call stack once, on the calling thread: the scan needs it both to decide whether loading a class
+        // on a worker thread could deadlock (#933) and to find the caller's classloaders and module layers
+        final var callStackInfo = CallStackInfo.read();
+        try {
+            return new Scanner(performScan, callStackInfo, scanSpec, scanSourceSpec, executorService,
+                    numTasksWithoutDeadlockHazard(callStackInfo, numParallelTasks), topLevelLog).call();
+
+        } catch (final InterruptedException e) {
+            // Throwing InterruptedException cleared the interrupt status, and this method reports the interruption
+            // as an unchecked exception rather than rethrowing it, so restore the status, otherwise a caller that
+            // catches ClassGraphException sees a thread that no longer looks interrupted
+            Thread.currentThread().interrupt();
+            throw new ClassGraphException("Scan interrupted", e);
+        } catch (final CancellationException e) {
+            throw new ClassGraphException("Scan interrupted", e);
+        } catch (final ExecutionException e) {
+            throw new ClassGraphException("Uncaught exception during scan", InterruptionChecker.getCause(e));
+        } catch (final RuntimeException e) {
+            // An unchecked exception thrown by the scanner used to reach the caller wrapped in an
+            // ExecutionException by the Future, and was rewrapped as the cause of a ClassGraphException, so wrap it
+            // the same way here rather than letting it propagate unwrapped
+            throw new ClassGraphException("Uncaught exception during scan", e);
+        }
+    }
+
+    /**
+     * Reduce the number of parallel tasks to 1 if the calling thread is holding a lock that the classloader would
+     * also need in order to load one of ClassGraph's own classes on a worker thread. Loading a class on a worker
+     * thread would then deadlock the scan, and the deadlock cannot be broken, since a thread that is blocked on
+     * class loading cannot be interrupted (#933). Running the whole scan on the calling thread is slower, but it
+     * loads every class the scan needs on the thread that already holds the lock, so it cannot deadlock.
+     *
+     * @param callStackInfo
+     *            The call stack of the calling thread.
+     * @param numParallelTasks
+     *            The requested number of parallel tasks.
+     * @return the number of parallel tasks to use.
+     */
+    private int numTasksWithoutDeadlockHazard(final CallStackInfo callStackInfo, final int numParallelTasks) {
+        if (numParallelTasks <= 1) {
+            // The scan already runs entirely on the calling thread
+            return numParallelTasks;
+        }
+        final var frame = callStackInfo.getFrameHoldingClassLoadingLock();
+        if (frame == null) {
+            return numParallelTasks;
+        }
+        if (topLevelLog != null) {
+            topLevelLog.log("The thread that called scan() is holding a class loading lock in " + frame
+                    + ", so loading a class on a worker thread could deadlock the scan (#933) -- running the "
+                    + "whole scan on the calling thread instead of using " + numParallelTasks + " threads");
+        }
+        return 1;
+    }
+
+    /**
+     * Scan the enabled classpath elements and modules with the requested parallelism, blocking until the scan is
+     * complete. Nothing is scanned unless one of the {@code enable} methods was called. You should assign the
+     * returned {@link ScanResult} in a try-with-resources statement, or manually close it when you are finished
+     * with it.
+     *
+     * <p>
+     * Calling this with a {@code numThreads} of 1 starts no worker threads at all: the whole scan is run on the
+     * calling thread, so every class the scan needs is loaded on the calling thread. Use that if the calling thread
+     * holds a lock that the classloader also acquires, since loading a class on a worker thread would then deadlock
+     * (#933). The two commonest ways to hold such a lock are detected automatically -- calling {@code scan()} from
+     * a static initializer, or from a {@link ClassLoader} that is loading a class -- and the scan then falls back
+     * to running on the calling thread whatever {@code numThreads} says, noting it in the verbose log.
+     *
+     * @param numThreads
+     *            The total number of parallel tasks, including the calling thread. Must be at least 1. If 1, the
+     *            scan is run entirely on the calling thread.
+     * @return a {@link ScanResult} object representing the result of the scan.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if {@code numThreads} is less than 1, or if a config option was enabled without the config option
+     *             that reads it.
+     */
+    public ScanResult scan(final int numThreads) {
+        checkNumParallelTasks(numThreads);
+        try (var executorService = new AutoCloseableExecutorService(numThreads, scanSpec.getWorkerTimeoutNanos())) {
+            return scan(executorService, numThreads);
+        }
+    }
+
+    /**
+     * Scan the enabled classpath elements and modules, blocking until the scan is complete. Nothing is scanned
+     * unless one of the {@code enable} methods was called, so a {@link ClassGraph} that enabled no source of
+     * classes produces an empty {@link ScanResult}. You should assign the returned {@link ScanResult} in a
+     * try-with-resources statement, or manually close it when you are finished with it.
+     *
+     * @return a {@link ScanResult} object representing the result of the scan.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the config option that reads it.
+     */
+    public ScanResult scan() {
+        return scan(DEFAULT_NUM_WORKER_THREADS);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get a {@link ScanResult} that can be used for determining the classpath.
+     *
+     * @param executorService
+     *            The executor service.
+     * @return a {@link ScanResult} object representing the result of the scan (can only be used for determining
+     *         classpath).
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     */
+    ScanResult getClasspathScanResult(final AutoCloseableExecutorService executorService) {
+        return scanOnThisThread(/* performScan = */ false, executorService, DEFAULT_NUM_WORKER_THREADS);
+    }
+
+    /**
+     * Returns the list of unique File objects representing the enabled directory and zip/jarfile classpath
+     * elements, in classloader resolution order. Only the classpath elements that would have been scanned are
+     * returned: a classpath element is found only if it was enabled with {@link #enableClasspath()},
+     * {@link #enableClassLoaders(ClassLoader...)} or {@link #enableClasspathEntries(Object...)}, and was not
+     * narrowed out by an {@code accept} or {@code reject} method. Classpath elements that do not exist as a file or
+     * directory are not included in the returned list.
+     *
+     * @return a {@code List<File>} consisting of the unique enabled directories and jarfiles, in classpath
+     *         resolution order.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the config option that reads it.
+     */
+    public List<File> getClasspathFiles() {
+        try (var executorService = new AutoCloseableExecutorService(DEFAULT_NUM_WORKER_THREADS,
+                scanSpec.getWorkerTimeoutNanos()); var scanResult = getClasspathScanResult(executorService)) {
+            return scanResult.getClasspathFiles();
+        }
+    }
+
+    /**
+     * Returns the unique enabled directory and zip/jarfile classpath elements, in classloader resolution order, in
+     * the form of a classpath path string. Only the classpath elements that would have been scanned are returned,
+     * as described in {@link #getClasspathFiles()}. Classpath elements that do not exist as a file or directory are
+     * not included in the returned list. Note that the returned string contains only base files, and does not
+     * include package roots or nested jars within jars, since the path separator (':') conflicts with the URL
+     * scheme separator character (also ':') on Linux and Mac OS X. Call {@link #getClasspathURIs()} to get the full
+     * URIs for classpath elements and modules.
+     *
+     * @return a classpath path string consisting of the unique enabled directories and jarfiles, in classpath
+     *         resolution order.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the config option that reads it.
+     */
+    public String getClasspath() {
+        return PathList.join(getClasspathFiles());
+    }
+
+    /**
+     * Returns the ordered list of unique {@link URI} objects representing the enabled directory/jar classpath
+     * elements and modules. Only the classpath elements and modules that would have been scanned are returned, as
+     * described in {@link #getClasspathFiles()} and {@link #getModuleReferences()}. Classpath elements representing
+     * jarfiles or directories that do not exist are not included in the returned list.
+     *
+     * @return the unique enabled classpath elements and modules, as a list of {@link URI} objects.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the config option that reads it.
+     */
+    public List<URI> getClasspathURIs() {
+        try (var executorService = new AutoCloseableExecutorService(DEFAULT_NUM_WORKER_THREADS,
+                scanSpec.getWorkerTimeoutNanos()); var scanResult = getClasspathScanResult(executorService)) {
+            return scanResult.getClasspathURIs();
+        }
+    }
+
+    /**
+     * Returns the ordered list of unique {@link URL} objects representing the enabled directory/jar classpath
+     * elements and modules, as described in {@link #getClasspathURIs()}. Classpath elements representing jarfiles
+     * or directories that do not exist, as well as modules with unknown (null) location or with {@code jrt:}
+     * location URI scheme, are not included in the returned list.
+     *
+     * @return the unique enabled classpath elements and modules, as a list of {@link URL} objects.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the config option that reads it.
+     */
+    public List<URL> getClasspathURLs() {
+        try (var executorService = new AutoCloseableExecutorService(DEFAULT_NUM_WORKER_THREADS,
+                scanSpec.getWorkerTimeoutNanos()); var scanResult = getClasspathScanResult(executorService)) {
+            return scanResult.getClasspathURLs();
+        }
+    }
+
+    /**
+     * Returns the {@link ModuleReference} for each enabled module. Only the modules that would have been scanned
+     * are returned: a module is found only if it was enabled with {@link #enableSystemModules()},
+     * {@link #enableNonSystemModules()} or {@link #enableModuleLayers(ModuleLayer...)}, and was not narrowed out by
+     * {@link #acceptModules(String...)} or {@link #rejectModules(String...)}.
+     *
+     * @return a list of the {@link ModuleReference} for each enabled module.
+     * @throws ClassGraphException
+     *             if any of the worker threads throws an uncaught exception, or the scan was interrupted.
+     * @throws IllegalArgumentException
+     *             if a config option was enabled without the config option that reads it.
+     */
+    public List<ModuleReference> getModuleReferences() {
+        try (var executorService = new AutoCloseableExecutorService(DEFAULT_NUM_WORKER_THREADS,
+                scanSpec.getWorkerTimeoutNanos()); var scanResult = getClasspathScanResult(executorService)) {
+            return scanResult.getModuleReferences();
+        }
+    }
+
+    /**
+     * Get the module path info provided on the commandline with {@code --module-path}, {@code --add-modules},
+     * {@code --patch-module}, {@code --add-exports}, {@code --add-opens}, and {@code --add-reads}.
+     *
+     * <p>
+     * Note that the returned {@link ModulePathInfo} object reports what the commandline asked for, whether or not
+     * any of it was enabled for scanning, and does not include classpath entries from the traditional classpath or
+     * system modules. This is an immutable snapshot of JVM command-line arguments; manifest attributes encountered
+     * during a scan do not mutate it. Use {@link #getModuleReferences()} to get the modules that were enabled.
+     *
+     * @return The {@link ModulePathInfo}.
+     */
+    public ModulePathInfo getModulePathInfo() {
+        return scanSpec.classpathSpec.getModulePathInfo();
+    }
+}

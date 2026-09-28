@@ -1,0 +1,145 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph.vfs.internal.slice;
+
+import java.io.IOException;
+import java.util.Arrays;
+
+import io.github.classgraph.vfs.Vfs;
+import io.github.classgraph.vfs.reader.RandomAccessArrayReader;
+import io.github.classgraph.vfs.reader.RandomAccessReader;
+
+/** A byte array slice. */
+public final class ArraySlice extends Slice {
+    /** The wrapped byte array. */
+    public final byte[] arr;
+
+    /**
+     * Constructor for treating a range of an array as a slice.
+     *
+     * @param parentSlice
+     *            the parent slice
+     * @param offset
+     *            the offset of the sub-slice within the parent slice
+     * @param length
+     *            the length of the sub-slice
+     * @param isDeflatedZipEntry
+     *            true if this is a deflated zip entry
+     * @param inflatedLengthHint
+     *            the uncompressed size of a deflated zip entry, or -1 if unknown, or 0 if this is not a deflated
+     *            zip entry.
+     * @param vfs
+     *            the {@link Vfs} that opened this slice
+     */
+    private ArraySlice(final ArraySlice parentSlice, final long offset, final long length,
+            final boolean isDeflatedZipEntry, final long inflatedLengthHint, final Vfs vfs) {
+        super(parentSlice, offset, length, isDeflatedZipEntry, inflatedLengthHint, vfs);
+        this.arr = parentSlice.arr;
+    }
+
+    /**
+     * Constructor for treating a whole array as a slice.
+     *
+     * @param arr
+     *            the array containing the slice.
+     * @param isDeflatedZipEntry
+     *            true if this is a deflated zip entry
+     * @param inflatedLengthHint
+     *            the uncompressed size of a deflated zip entry, or -1 if unknown, or 0 if this is not a deflated
+     *            zip entry.
+     * @param vfs
+     *            the {@link Vfs} that opened this slice
+     */
+    public ArraySlice(final byte[] arr, final boolean isDeflatedZipEntry, final long inflatedLengthHint,
+            final Vfs vfs) {
+        super(arr.length, isDeflatedZipEntry, inflatedLengthHint, vfs);
+        this.arr = arr;
+    }
+
+    /**
+     * Slice this slice to form a sub-slice.
+     *
+     * @param offset
+     *            the offset relative to the start of this slice to use as the start of the sub-slice.
+     * @param length
+     *            the length of the sub-slice.
+     * @param isDeflatedZipEntry
+     *            true if the sub-slice is a deflated zip entry
+     * @param inflatedLengthHint
+     *            the uncompressed size of a deflated zip entry, or -1 if unknown, or 0 if this is not a deflated
+     *            zip entry.
+     * @return the slice
+     */
+    @Override
+    public Slice slice(final long offset, final long length, final boolean isDeflatedZipEntry,
+            final long inflatedLengthHint) {
+        if (this.isDeflatedZipEntry) {
+            throw new IllegalArgumentException("Cannot slice a deflated zip entry");
+        }
+        return new ArraySlice(this, offset, length, isDeflatedZipEntry, inflatedLengthHint, vfs);
+    }
+
+    /**
+     * Load the slice as a byte array.
+     *
+     * <p>
+     * When the slice covers the whole of the backing array and the entry is not deflated, the backing array itself
+     * is returned rather than a copy, so a caller that writes to the returned array changes what every later read
+     * of the same slice sees.
+     *
+     * @return the content of the slice
+     * @throws IOException
+     *             if the slice could not be read.
+     */
+    @Override
+    public byte[] load() throws IOException {
+        if (isDeflatedZipEntry) {
+            // Inflate into RAM if deflated
+            try (var inputStream = open()) {
+                return Slice.readAllBytesAsArray(inputStream, inflatedLengthHint);
+            }
+        } else if (sliceStartPos == 0L && sliceLength == arr.length) {
+            // Fast path -- return whole array, if the array is the whole slice and is not deflated
+            return arr;
+        } else {
+            // Copy range of array, if it is a slice and it is not deflated
+            return Arrays.copyOfRange(arr, (int) sliceStartPos, (int) (sliceStartPos + sliceLength));
+        }
+    }
+
+    /**
+     * Return a new random access reader.
+     *
+     * @return the random access reader
+     */
+    @Override
+    public RandomAccessReader randomAccessReader() {
+        return new RandomAccessArrayReader(arr, (int) sliceStartPos, (int) sliceLength);
+    }
+}

@@ -1,0 +1,301 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph.classpath.internal;
+
+import java.util.List;
+import java.util.Map.Entry;
+
+import io.github.classgraph.base.LogNode;
+import io.github.classgraph.base.internal.path.PathList;
+import io.github.classgraph.base.internal.utils.VersionFinder;
+import io.github.classgraph.classpath.ClassLoaderHandler;
+import io.github.classgraph.classpath.internal.ScanSourceSpec.ClasspathSource;
+import io.github.classgraph.classpath.internal.ScanSourceSpec.ClasspathString;
+import io.github.classgraph.classpath.internal.ScanSourceSpec.NamedClassLoaders;
+import io.github.classgraph.classpath.internal.ScanSourceSpec.NamedClasspathEntries;
+import io.github.classgraph.classpath.internal.classloaderhandler.ClassLoaderHandlerRegistry;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Finds the classpath elements and modules of the sources that the caller enabled, in the order classes are
+ * resolved from them.
+ */
+public class ClassLoaderProbe {
+    /** The classpath order. */
+    private final ClasspathOrderBuilder classpathOrder;
+
+    /** The {@link ModuleFinder}, if any module layer is being searched. */
+    private final @Nullable ModuleFinder moduleFinder;
+
+    /**
+     * The first of the classloaders found in the environment, which is the classloader that is recorded for a
+     * classpath entry that no classloader declared, or null if no classloader was found.
+     */
+    private final @Nullable ClassLoader defaultClassLoader;
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get the classpath order.
+     *
+     * @return The order of raw classpath elements obtained from ClassLoaders.
+     */
+    public ClasspathOrderBuilder getClasspathOrder() {
+        return classpathOrder;
+    }
+
+    /**
+     * Get the {@link ModuleFinder}.
+     *
+     * @return The {@link ModuleFinder}, or null if no module layer is being searched.
+     */
+    public @Nullable ModuleFinder getModuleFinder() {
+        return moduleFinder;
+    }
+
+    /**
+     * Get the classloader to record for anything that no classloader declared, which is the first of the
+     * classloaders found in the environment: the context classloader of the calling thread, if it has one.
+     *
+     * @return the classloader, or null if no classloader was found in the environment.
+     */
+    public @Nullable ClassLoader getDefaultClassLoader() {
+        return defaultClassLoader;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Find the classpath elements and modules of the sources that the caller enabled, reading the call stack of the
+     * calling thread in order to find the classloaders and module layers that the caller can see.
+     *
+     * <p>
+     * Call this only from the thread that asked for the classpath. If the caller has already read its own call
+     * stack -- as ClassGraph has, since it checks the stack for a class loading lock before it starts a scan (#933)
+     * -- then pass that call stack to
+     * {@link #ClassLoaderProbe(CallStackInfo, ClasspathSpec, ScanSourceSpec, LogNode)} instead, rather than walking
+     * the stack a second time.
+     *
+     * @param classpathSpec
+     *            The {@link ClasspathSpec}.
+     * @param scanSourceSpec
+     *            The places to look for classpath elements and modules.
+     * @param log
+     *            The log.
+     */
+    public ClassLoaderProbe(final ClasspathSpec classpathSpec, final ScanSourceSpec scanSourceSpec,
+            final @Nullable LogNode log) {
+        this(CallStackInfo.read(), classpathSpec, scanSourceSpec, log);
+    }
+
+    /**
+     * Find the classpath elements and modules of the sources that the caller enabled, using a call stack that has
+     * already been read.
+     *
+     * @param callStackInfo
+     *            The call stack of the thread that asked for the classpath, which names the classloaders and module
+     *            layers that the caller can see.
+     * @param classpathSpec
+     *            The {@link ClasspathSpec}.
+     * @param scanSourceSpec
+     *            The places to look for classpath elements and modules.
+     * @param log
+     *            The log.
+     */
+    public ClassLoaderProbe(final CallStackInfo callStackInfo, final ClasspathSpec classpathSpec,
+            final ScanSourceSpec scanSourceSpec, final @Nullable LogNode log) {
+        final var classLoaderProbeLog = log == null ? null : log.log("Finding classpath and modules");
+
+        // The modules are searched before the classpath, whatever order the sources were enabled in, because that is
+        // the order in which the JVM resolves a class: a builtin classloader looks the class's package up among the
+        // modules before it delegates to its parent or falls back to its classpath
+        moduleFinder = scanSourceSpec.searchesDetectedModuleLayers() || scanSourceSpec.namedModuleLayers != null
+                ? new ModuleFinder(callStackInfo, classpathSpec, scanSourceSpec, classLoaderProbeLog)
+                : null;
+
+        classpathOrder = new ClasspathOrderBuilder(classpathSpec);
+
+        // The classloaders in the environment are found whether or not they are one of the sources to search, since
+        // the first of them is the classloader that the scan falls back to when it has to load a class, and the one
+        // that the entries of java.class.path are recorded against
+        final var environmentClassLoaders = new ClassLoaderFinder(callStackInfo, classLoaderProbeLog)
+                .getClassLoaders();
+        defaultClassLoader = environmentClassLoaders.isEmpty() ? null : environmentClassLoaders.get(0);
+
+        // The ClassLoaderHandlers the user registered. These are offered each classloader before the built-in
+        // handlers are, so that a user handler can override a built-in one.
+        final var userClassLoaderHandlers = classpathSpec.getClassLoaderHandlers();
+        if (classLoaderProbeLog != null) {
+            final var classLoaderHandlerLog = classLoaderProbeLog.log("ClassLoaderHandlers:");
+            for (final ClassLoaderHandler classLoaderHandler : userClassLoaderHandlers) {
+                classLoaderHandlerLog.log(classLoaderHandler.getClass().getName() + " (registered by the caller)");
+            }
+            for (final ClassLoaderHandler classLoaderHandler : ClassLoaderHandlerRegistry.CLASS_LOADER_HANDLERS) {
+                classLoaderHandlerLog.log(classLoaderHandler.getClass().getName());
+            }
+        }
+
+        // Every classloader source shares one classloader order, so that a classloader that more than one source
+        // reaches is only searched once, at the first position it is reached at
+        final var classLoaderOrder = new ClassLoaderOrderBuilder(userClassLoaderHandlers);
+        var numClassLoadersSearched = 0;
+
+        // Search the classpath sources in the order the caller enabled them in
+        for (final ClasspathSource classpathSource : scanSourceSpec.classpathSources) {
+            if (classpathSource instanceof final NamedClasspathEntries namedClasspathEntries) {
+                addNamedClasspathEntries(namedClasspathEntries.classpathEntries(), classLoaderProbeLog);
+            } else if (classpathSource instanceof final ClasspathString classpathString) {
+                // The classpath is split here rather than when the caller handed it over, so that a URL scheme the
+                // caller registered afterwards still keeps its own ':' from being read as a separator
+                addNamedClasspathEntries(
+                        List.of(PathList.split(classpathString.classpath(), classpathSpec.getAllowedURLSchemes())),
+                        classLoaderProbeLog);
+            } else {
+                final var classLoaders = classpathSource instanceof final NamedClassLoaders namedClassLoaders
+                        ? namedClassLoaders.classLoaders()
+                        : environmentClassLoaders;
+                numClassLoadersSearched = addClassLoaderClasspathEntries(classLoaders, classpathSpec,
+                        classLoaderOrder, numClassLoadersSearched, classLoaderProbeLog);
+            }
+        }
+
+        // The application classloader's own classpath entries are added by its ClassLoaderHandler, at the position
+        // the application classloader takes in the delegation order. The only case that handler cannot cover is an
+        // unnamed module layer: the ModuleLayer API does not allow an unnamed module to be opened, so the classes
+        // in it can only be reached through java.class.path, whether or not the application classloader is being
+        // scanned. Anything added here that the handler already added is dropped as a duplicate.
+        if (moduleFinder != null && moduleFinder.forceScanJavaClassPath()) {
+            addJavaClassPathEntries(classLoaderProbeLog);
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Add the classpath entries that the caller named directly.
+     *
+     * @param classpathEntries
+     *            the classpath entries
+     * @param log
+     *            the log node, or null to skip logging
+     */
+    private void addNamedClasspathEntries(final List<?> classpathEntries, final @Nullable LogNode log) {
+        final var subLog = log == null ? null
+                : log.log("Adding the classpath entries given by the caller: " + classpathEntries);
+        // No classloader is recorded for an entry the caller named: the caller named a location to read, not a
+        // classloader to read it through, and a scan that was never asked to look at a classloader must not pin one
+        classpathOrder.addClasspathEntries(classpathEntries, /* classLoader = */ null, subLog);
+        if (subLog != null) {
+            subLog.log("WARNING: when the classpath entries are given directly, there is no guarantee that the "
+                    + "classes found by classpath scanning will be the same as the classes loaded by the "
+                    + "context classloader");
+        }
+    }
+
+    /**
+     * Find the unique classloaders that the given classloaders delegate to, in delegation order, then add the
+     * classpath entries that each of them loads from, using the {@code ClassLoaderHandler} registered for the
+     * classloader.
+     *
+     * @param classLoaders
+     *            the classloaders to search
+     * @param classpathSpec
+     *            the {@link ClasspathSpec}
+     * @param classLoaderOrder
+     *            the classloader order, which is shared by all the classloader sources
+     * @param numClassLoadersSearched
+     *            the number of classloaders in {@code classLoaderOrder} that an earlier source already searched
+     * @param log
+     *            the log node, or null to skip logging
+     * @return the new number of classloaders in {@code classLoaderOrder} that have been searched
+     */
+    private int addClassLoaderClasspathEntries(final List<ClassLoader> classLoaders,
+            final ClasspathSpec classpathSpec, final ClassLoaderOrderBuilder classLoaderOrder,
+            final int numClassLoadersSearched, final @Nullable LogNode log) {
+        // Find the unique classloaders these classloaders delegate to, in delegation order. This appends to the
+        // shared classloader order, so a classloader an earlier source already reached is not listed again.
+        final var classloaderOrderLog = log == null ? null
+                : log.log("Finding unique classloaders in delegation order");
+        for (final ClassLoader classLoader : classLoaders) {
+            classLoaderOrder.delegateTo(classLoader, /* isParent = */ false, classloaderOrderLog);
+        }
+
+        // Get all parent classloaders
+        final var allParentClassLoaders = classLoaderOrder.getAllParentClassLoaders();
+
+        // Get the classpath entries from each of the classloaders this source added to the order
+        final var classLoaderOrderEntries = classLoaderOrder.getClassLoaderOrder();
+        final var classloaderURLLog = log == null ? null
+                : log.log("Obtaining URLs from classloaders in delegation order");
+        for (final Entry<ClassLoader, List<ClassLoaderHandler>> ent : classLoaderOrderEntries
+                .subList(numClassLoadersSearched, classLoaderOrderEntries.size())) {
+            final var classLoader = ent.getKey();
+            for (final ClassLoaderHandler classLoaderHandler : ent.getValue()) {
+                if (classpathSpec.isParentClassLoadersIgnored() && allParentClassLoaders.contains(classLoader)) {
+                    if (classloaderURLLog != null) {
+                        classloaderURLLog.log("Ignoring parent classloader " + classLoader
+                                + ", normally handled by " + classLoaderHandler.getClass().getName());
+                    }
+                } else {
+                    // Add the classpath entries to classpathOrder
+                    final var classloaderHandlerLog = classloaderURLLog == null ? null
+                            : classloaderURLLog.log("Classloader " + classLoader.getClass().getName()
+                                    + " is handled by " + classLoaderHandler.getClass().getName());
+                    // Record the package roots that this ClassLoaderHandler's classpath elements can have, so that
+                    // only the package roots that are applicable to each classpath element are looked for and
+                    // stripped when it is scanned (#929), and likewise the lib dirs that this ClassLoaderHandler
+                    // loads jarfiles from without listing them as classpath elements
+                    classpathOrder.setPackageRootPrefixes(classLoaderHandler.getPackageRootPrefixes());
+                    classpathOrder.setLibDirPrefixes(classLoaderHandler.getLibDirPrefixes());
+                    try {
+                        classLoaderHandler.findClasspathOrder(classLoader, classpathOrder, classloaderHandlerLog);
+                    } finally {
+                        classpathOrder.setPackageRootPrefixes(null);
+                        classpathOrder.setLibDirPrefixes(null);
+                    }
+                }
+            }
+        }
+        return classLoaderOrderEntries.size();
+    }
+
+    /**
+     * Add the classpath entries listed in the {@code java.class.path} system property.
+     *
+     * @param log
+     *            the log node, or null to skip logging
+     */
+    private void addJavaClassPathEntries(final @Nullable LogNode log) {
+        final var javaClassPath = VersionFinder.getProperty("java.class.path");
+        if (javaClassPath != null && !javaClassPath.isEmpty()) {
+            classpathOrder.addClasspathPathStr(javaClassPath, defaultClassLoader,
+                    log == null ? null : log.log("Getting classpath entries from java.class.path"));
+        }
+    }
+}

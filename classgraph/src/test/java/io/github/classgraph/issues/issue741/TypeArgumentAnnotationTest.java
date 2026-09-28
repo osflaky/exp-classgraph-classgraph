@@ -1,0 +1,61 @@
+package io.github.classgraph.issues.issue741;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+import java.util.List;
+
+import org.junit.jupiter.api.Test;
+
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ClassRefTypeSignature;
+
+public class TypeArgumentAnnotationTest {
+    @Target({ ElementType.FIELD, ElementType.TYPE_USE, ElementType.TYPE_PARAMETER })
+    private static @interface A {
+    }
+
+    @Target({ ElementType.FIELD, ElementType.TYPE_USE, ElementType.TYPE_PARAMETER })
+    private static @interface B {
+        String value();
+    }
+
+    @Target({ ElementType.FIELD, ElementType.TYPE_USE, ElementType.TYPE_PARAMETER })
+    private static @interface C {
+        Class<?> t();
+    }
+
+    @Target({ ElementType.FIELD, ElementType.TYPE_USE, ElementType.TYPE_PARAMETER })
+    private static @interface D {
+        int n();
+    }
+
+    static class U {
+    }
+
+    // The annotations on this parameter are the fixture -- the parameter itself is never used
+    @SuppressWarnings("unused")
+    void setValueList(final List<@A @B("foo") @C(t = U.class) @D(n = 50) ?> valueList) {
+    }
+
+    @Test
+    void typeArgumentAnnotation() {
+        try (var scanResult = new ClassGraph().enableClasspath()
+                .acceptPackages(TypeArgumentAnnotationTest.class.getPackage().getName()).enableClassInfo()
+                .enableFieldInfo().enableMethodInfo().enableAnnotationInfo()
+                .enableStaticFinalFieldConstantInitializerValues().ignoreClassVisibility().ignoreFieldVisibility()
+                .ignoreMethodVisibility().scan()) {
+            final var cls = scanResult.getClassInfo(TypeArgumentAnnotationTest.class.getName());
+            final var method = cls.getMethodInfo().get("setValueList").get(0);
+            final var parameterInfo = method.getParameterInfo().get(0);
+            final var typeArgument = ((ClassRefTypeSignature) parameterInfo.getTypeSignatureOrTypeDescriptor())
+                    .getTypeArguments().get(0);
+            final var annotationInfoList = typeArgument.getTypeAnnotationInfo();
+            assertThat(annotationInfoList.get(0).toStringWithSimpleNames()).isEqualTo("@A");
+            assertThat(annotationInfoList.get(1).toStringWithSimpleNames()).isEqualTo("@B(\"foo\")");
+            assertThat(annotationInfoList.get(2).toStringWithSimpleNames()).isEqualTo("@C(t=U.class)");
+            assertThat(annotationInfoList.get(3).toStringWithSimpleNames()).isEqualTo("@D(n=50)");
+        }
+    }
+}

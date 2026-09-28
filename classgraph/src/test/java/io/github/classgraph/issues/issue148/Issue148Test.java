@@ -1,0 +1,95 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph.issues.issue148;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import org.junit.jupiter.api.Test;
+
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ClassInfo;
+
+public class Issue148Test {
+    /** The anonymous inner class 1. */
+    // N.B. this must remain an anonymous inner class rather than a lambda -- the test asserts on the Issue148Test$1
+    // classfile that the compiler generates for it.
+    final Runnable anonymousInnerClass1 = new Runnable() {
+        @Override
+        public void run() {
+        }
+    };
+
+    @Test
+    public void issue148Test() {
+        // N.B. as above, this must remain an anonymous inner class (Issue148Test$2), not a lambda.
+        final Runnable anonymousInnerClass2 = new Runnable() {
+            @Override
+            public void run() {
+            }
+        };
+        // Fix FindBugs warning (dead store to anonymousInnerClass2)
+        @SuppressWarnings("unused")
+        final var s = anonymousInnerClass2.toString();
+
+        final var pkg = Issue148Test.class.getPackage().getName();
+        final var buf = new StringBuilder();
+        try (var scanResult = new ClassGraph().enableClasspath().acceptPackages(pkg).enableClassInfo()
+                .enableFieldInfo().enableMethodInfo().enableAnnotationInfo()
+                .enableStaticFinalFieldConstantInitializerValues().ignoreClassVisibility().ignoreFieldVisibility()
+                .ignoreMethodVisibility().scan()) {
+            for (final ClassInfo ci : scanResult.getAllClasses()) {
+                buf.append(ci.getName()).append("|");
+                buf.append(ci.isNestedClass()).append(" ").append(ci.isAnonymousClass()).append(" ")
+                        .append(ci.hasNestedClasses()).append("|");
+                buf.append(ci.getNestedClasses().getNames()).append("|");
+                buf.append(ci.getEnclosingClasses().getNames()).append("|");
+                buf.append(ci.getFullyQualifiedDefiningMethodName()).append("\n");
+            }
+        }
+        final var bufStr = buf.toString().replace(pkg + ".", "");
+
+        // System.out.println("\"" + bufStr.replace("\n", "\\n\" //\n+\"") + "\"");
+
+        assertThat(bufStr) //
+                .isEqualTo("""
+                        Issue148Test|false false true|[Issue148Test$1, Issue148Test$2]|[]|null
+                        Issue148Test$1|true true false|[]|[Issue148Test]|null
+                        Issue148Test$2|true true false|[]|[Issue148Test]|Issue148Test.issue148Test
+                        O1|false false true|[O1$I, O1$I$II, O1$I$II$1, O1$I$II$2, O1$SI]|[]|null
+                        O1$I|true false true|[O1$I$II, O1$I$II$1, O1$I$II$2]|[O1]|null
+                        O1$I$II|true false true|[O1$I$II$1, O1$I$II$2]|[O1$I, O1]|null
+                        O1$I$II$1|true true false|[]|[O1$I$II, O1$I, O1]|O1$I$II.newSI
+                        O1$I$II$2|true true false|[]|[O1$I$II, O1$I, O1]|O1$I$II.newI
+                        O1$SI|true false false|[]|[O1]|null
+                        O2|false false true|[O2$1, O2$2]|[]|null
+                        O2$1|true true false|[]|[O2]|null
+                        O2$2|true true false|[]|[O2]|O2.<init>
+                        """);
+    }
+}

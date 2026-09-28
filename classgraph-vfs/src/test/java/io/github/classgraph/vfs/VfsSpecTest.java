@@ -1,0 +1,78 @@
+package io.github.classgraph.vfs;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import org.junit.jupiter.api.Test;
+
+/** The settings a {@link Vfs} is constructed with. */
+public class VfsSpecTest {
+    /** Every setting starts at its documented default. */
+    @Test
+    public void everySettingStartsAtItsDefault() {
+        final var vfsSpec = new VfsSpec();
+        assertThat(vfsSpec.isNestedJarsEnabled()).isEqualTo(VfsSpec.DEFAULT_ENABLE_NESTED_JARS);
+        assertThat(vfsSpec.isMultiReleaseVersionsEnabled())
+                .isEqualTo(VfsSpec.DEFAULT_ENABLE_MULTI_RELEASE_VERSIONS);
+        assertThat(vfsSpec.getMaxBufferedJarRAMSize()).isEqualTo(VfsSpec.DEFAULT_MAX_BUFFERED_JAR_RAM_SIZE);
+        assertThat(vfsSpec.getDeniedURLSchemes()).isEmpty();
+    }
+
+    /** Every setter returns the same object, so that settings can be chained. */
+    @Test
+    public void settersChain() {
+        final var vfsSpec = new VfsSpec();
+        assertThat(vfsSpec.disableNestedJars().enableMultiReleaseVersions().setMaxBufferedJarRAMSize(65_536)
+                .denyURLScheme("https")).isSameAs(vfsSpec);
+
+        assertThat(vfsSpec.isNestedJarsEnabled()).isFalse();
+        assertThat(vfsSpec.isMultiReleaseVersionsEnabled()).isTrue();
+        assertThat(vfsSpec.getMaxBufferedJarRAMSize()).isEqualTo(65_536);
+        assertThat(vfsSpec.getDeniedURLSchemes()).containsExactly("https");
+
+        assertThat(vfsSpec.enableNestedJars().disableMultiReleaseVersions().allowURLScheme("https"))
+                .isSameAs(vfsSpec);
+        assertThat(vfsSpec.isNestedJarsEnabled()).isTrue();
+        assertThat(vfsSpec.isMultiReleaseVersionsEnabled()).isFalse();
+        assertThat(vfsSpec.getDeniedURLSchemes()).isEmpty();
+    }
+
+    /**
+     * A URL scheme is lowercased, added to the schemes already denied, and published as an unmodifiable set, sorted
+     * by scheme name rather than in the order the schemes were denied.
+     */
+    @Test
+    public void deniedURLSchemesAccumulate() {
+        final var vfsSpec = new VfsSpec().denyURLScheme("HTTPS").denyURLScheme("http");
+        assertThat(vfsSpec.getDeniedURLSchemes()).containsExactly("http", "https");
+        assertThatThrownBy(() -> vfsSpec.getDeniedURLSchemes().add("ftp"))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    /** Allowing a scheme takes it back off the denied list, whatever case it is named in. */
+    @Test
+    public void allowingASchemeUndoesDenyingIt() {
+        final var vfsSpec = new VfsSpec().denyURLScheme("http").denyURLScheme("https");
+        assertThat(vfsSpec.allowURLScheme("HTTP").getDeniedURLSchemes()).containsExactly("https");
+        // Allowing a scheme that was never denied is a no-op, rather than an error
+        assertThat(vfsSpec.allowURLScheme("ftp").getDeniedURLSchemes()).containsExactly("https");
+    }
+
+    /** An invalid URL scheme is rejected. */
+    @Test
+    public void anInvalidURLSchemeIsRejected() {
+        assertThatThrownBy(() -> new VfsSpec().denyURLScheme("c")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new VfsSpec().denyURLScheme("http:")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new VfsSpec().allowURLScheme("c")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new VfsSpec().allowURLScheme("http:"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /** The settings are described in the verbose log. */
+    @Test
+    public void theSettingsAreDescribed() {
+        assertThat(new VfsSpec().denyURLScheme("https").setMaxBufferedJarRAMSize(1024).toString()).contains(
+                "nestedJars: true", "multiReleaseVersions: true", "deniedURLSchemes: [https]",
+                "maxBufferedJarRAMSize: 1024");
+    }
+}

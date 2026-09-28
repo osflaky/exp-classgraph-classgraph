@@ -1,0 +1,29 @@
+{
+    // Compiler warning settings for the Red Hat Java extension, which compiles with the Eclipse Java compiler.
+    // The Maven build hands the same file to the Eclipse batch compiler, so the editor and the build agree on
+    // every severity. The path is resolved against the workspace root folder. See the header of that file for
+    // what is on, what is off, and why.
+    "java.settings.url": ".vscode/org.eclipse.jdt.core.prefs",
+
+    // Format with the same Eclipse formatter profile that the Maven build uses, so that saving a file in the
+    // editor and running the build produce the same text. Without this the editor formats with the Eclipse
+    // defaults, which wrap at 120 columns where this profile wraps at 116, so the editor and the build rewrap
+    // each other's Javadoc every time either one runs.
+    "java.format.settings.url": ".eclipse/code-formatter-config.xml",
+    "java.format.settings.profile": "ClassGraph",
+
+    // Stop the language server compiling in the background. The Maven importer takes the output directory
+    // straight from the POM, so the language server writes its class files into the same target/classes that
+    // Maven writes, and there is no setting that moves them elsewhere (java.project.outputPath has no effect
+    // on a Maven project). Maven puts a module's own target/classes first on its compile classpath, so a
+    // language server build that lands part-way through a Maven build makes javac read half-written classes
+    // and report errors that are not in the sources -- and could equally hide errors that are. The editor
+    // still reports problems in the files that are open, which is analysed in memory rather than built.
+    "java.autobuild.enabled": false,
+
+    // Leave JDT's null analysis alone. On "automatic" the extension finds the JSpecify annotations on the
+    // classpath and switches JDT's own null analysis on for every project, overriding the setting in the file
+    // above -- and JDT has no JSpecify mode, so it then reports around 15,600 warnings that are not defects.
+    // NullAway does the null analysis instead, in the Maven build. Again, see the header of that file.
+    "java.compile.nullAnalysis.mode": "disabled"
+}

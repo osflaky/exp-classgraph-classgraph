@@ -1,0 +1,42 @@
+!.gitignore
+
+pom.xml.releaseBackup
+release.properties
+
+*.class
+!CompiledWithJDK8.class
+!module-info.class
+# Checked-in compiler-specific .class test fixtures for type-annotation handling (#897 / #926)
+!**/src/test/resources/io/github/classgraph/issues/issue897/ecjenum/*.class
+!**/src/test/resources/io/github/classgraph/issues/issue897/fieldcrash/*.class
+!**/src/test/resources/io/github/classgraph/issues/issue926/*.class
+
+target/
+bin/
+tmp/
+lib/
+*.tmp
+*.bak
+*~
+# What a JVM leaves behind when it dies: the crash log, the core dump it names in that log, the
+# compiler replay file, and the heap dump from -XX:+HeapDumpOnOutOfMemoryError. A crash writes these
+# into the working directory of the JVM, which for a forked test JVM is the module directory
+hs_err_pid*
+replay_pid*
+core.*
+*.hprof
+
+*.iml
+# Eclipse project metadata, including the copies a language server generates when it imports the
+# Maven build. It is generated from the POMs, so it is not checked in
+.project
+.classpath
+.metadata
+.settings/
+.loadpath
+.externalToolBuilders/
+*.launch
+.idea
+.cache*
+
+TODO-local

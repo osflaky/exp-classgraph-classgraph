@@ -1,0 +1,273 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph.classpath;
+
+import java.io.File;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+import io.github.classgraph.base.internal.path.PathList;
+import io.github.classgraph.base.internal.reflection.ReflectionUtils;
+import io.github.classgraph.base.internal.utils.StringUtils;
+
+/**
+ * The module system switches the JVM was launched with: {@code --module-path}, {@code --add-modules},
+ * {@code --patch-module}, {@code --add-exports}, {@code --add-opens} and {@code --add-reads}. Only what was given
+ * on the command line is listed here, so the traditional classpath and the system modules are not.
+ */
+public final class ModulePathInfo {
+    /** The module path provided by the {@code --module-path} or {@code -p} switch. */
+    private final Set<String> modulePath = new LinkedHashSet<>();
+
+    /** The modules added by the {@code --add-modules} switch. */
+    private final Set<String> addModules = new LinkedHashSet<>();
+
+    /** The module patch directives provided by the {@code --patch-module} switch. */
+    private final Set<String> patchModules = new LinkedHashSet<>();
+
+    /** The module {@code exports} directives added by the {@code --add-exports} switch. */
+    private final Set<String> addExports = new LinkedHashSet<>();
+
+    /** The module {@code opens} directives added by the {@code --add-opens} switch. */
+    private final Set<String> addOpens = new LinkedHashSet<>();
+
+    /** The module {@code reads} directives added by the {@code --add-reads} switch. */
+    private final Set<String> addReads = new LinkedHashSet<>();
+
+    /**
+     * One module path command line switch, and the values read for it.
+     *
+     * @param argSwitch
+     *            the switch, including its trailing {@code '='}. The JVM normalizes the other spellings of a switch
+     *            into this one before it reports its own command line: {@code -p dir} and {@code --module-path dir}
+     *            are both reported as {@code --module-path=dir}, so only this spelling has to be recognized.
+     * @param argPartSeparatorChar
+     *            the character that separates the values of one occurrence of the switch, or {@code '\0'} if the
+     *            switch takes a single value and has to be repeated to give more than one.
+     * @param values
+     *            the values read for the switch, in the order they were listed on the command line.
+     */
+    private record ModulePathSwitch(String argSwitch, char argPartSeparatorChar, Set<String> values) {
+        /**
+         * Add the value of one occurrence of this switch, splitting it into parts if the switch takes several
+         * values at once.
+         *
+         * @param argParam
+         *            the text that followed the switch.
+         */
+        private void addArgParam(final String argParam) {
+            if (argPartSeparatorChar == '\0') {
+                values.add(argParam);
+            } else {
+                values.addAll(
+                        Arrays.asList(PathList.split(argParam, argPartSeparatorChar, /* classpathSpec = */ null)));
+            }
+        }
+    }
+
+    /** The module path command line switches, each paired with the values read for it. */
+    private final List<ModulePathSwitch> modulePathSwitches = List.of( //
+            new ModulePathSwitch("--module-path=", File.pathSeparatorChar, modulePath), //
+            new ModulePathSwitch("--add-modules=", ',', addModules), //
+            new ModulePathSwitch("--patch-module=", '\0', patchModules), //
+            new ModulePathSwitch("--add-exports=", '\0', addExports), //
+            new ModulePathSwitch("--add-opens=", '\0', addOpens), //
+            new ModulePathSwitch("--add-reads=", '\0', addReads) //
+    );
+
+    /** Set to true once the command line arguments have been read. */
+    private boolean readCommandLineArguments;
+
+    /** Constructor. */
+    public ModulePathInfo() {
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Returns the module path provided on the command line by the {@code --module-path} or {@code -p} switch, as an
+     * ordered set of module path elements (directories and jarfiles, not module names), in the order they were
+     * listed on the command line.
+     *
+     * <p>
+     * Note that the modules the runtime adds by itself (such as the system modules) are not reached through this
+     * module path, so the modules they are defined in will not be found in any of these elements.
+     *
+     * @return The module path, as an unmodifiable set.
+     */
+    public Set<String> getModulePath() {
+        return snapshot(modulePath);
+    }
+
+    /**
+     * Returns the modules added to the module path on the command line using the {@code --add-modules} switch, as
+     * an ordered set of module names, in the order they were listed on the command line. Note that valid module
+     * names include {@code ALL-DEFAULT}, {@code ALL-SYSTEM}, and {@code ALL-MODULE-PATH} (see
+     * <a href="https://openjdk.java.net/jeps/261">JEP 261</a> for info).
+     *
+     * @return The added modules, as an unmodifiable set.
+     */
+    public Set<String> getAddModules() {
+        return snapshot(addModules);
+    }
+
+    /**
+     * Returns the module patch directives listed on the command line using the {@code --patch-module} switch, as an
+     * ordered set of strings in the format {@code <module>=<file>}, in the order they were listed on the command
+     * line.
+     *
+     * @return The module patch directives, as an unmodifiable set.
+     */
+    public Set<String> getPatchModules() {
+        return snapshot(patchModules);
+    }
+
+    /**
+     * Returns the module {@code exports} directives added on the command line using the {@code --add-exports}
+     * switch, as an ordered set of strings in the format
+     * {@code <source-module>/<package>=<target-module>(,<target-module>)*}, in the order they were listed on the
+     * command line.
+     *
+     * @return The {@code exports} directives, as an unmodifiable set.
+     */
+    public Set<String> getAddExports() {
+        return snapshot(addExports);
+    }
+
+    /**
+     * Returns the module {@code opens} directives added on the command line using the {@code --add-opens} switch,
+     * as an ordered set of strings in the format
+     * {@code <source-module>/<package>=<target-module>(,<target-module>)*}, in the order they were listed on the
+     * command line.
+     *
+     * @return The {@code opens} directives, as an unmodifiable set.
+     */
+    public Set<String> getAddOpens() {
+        return snapshot(addOpens);
+    }
+
+    /**
+     * Returns the module {@code reads} directives added on the command line using the {@code --add-reads} switch,
+     * as an ordered set of strings in the format {@code <source-module>=<target-module>}, in the order they were
+     * listed on the command line.
+     *
+     * @return The {@code reads} directives, as an unmodifiable set.
+     */
+    public Set<String> getAddReads() {
+        return snapshot(addReads);
+    }
+
+    /**
+     * Read the command line arguments if they have not been read yet, then return an unmodifiable copy of one of
+     * the field sets.
+     *
+     * @param field
+     *            the field set to snapshot.
+     * @return the snapshot.
+     */
+    private synchronized Set<String> snapshot(final Set<String> field) {
+        readCommandLineArguments();
+        return Collections.unmodifiableSet(new LinkedHashSet<>(field));
+    }
+
+    /**
+     * Fill in the module path fields from the VM command line arguments, the first time any of them is read.
+     *
+     * <p>
+     * Synchronized rather than guarded by an atomic flag, so that a second thread calling this concurrently blocks
+     * until the first thread has finished populating the field sets. An atomic test-and-set would let the second
+     * thread return immediately and read the (plain, non-thread-safe) {@link LinkedHashSet} fields while the first
+     * thread was still adding to them.
+     */
+    private synchronized void readCommandLineArguments() {
+        // The command line arguments are only read if the module path info is actually asked for, to avoid an
+        // illegal access warning on some JREs, e.g. Adopt JDK 11 (#605)
+        if (!readCommandLineArguments) {
+            readCommandLineArguments = true;
+            // Read the raw command line arguments to get the module path override parameters. If the java.management
+            // module is not present in the deployed runtime (for JDK 9+), or the runtime does not contain the
+            // java.lang.management package (e.g. the Android build system, which also does not support JPMS
+            // currently), then skip trying to read the command line arguments (#404).
+            final Class<?> managementFactory = ReflectionUtils
+                    .classForNameOrNull("java.lang.management.ManagementFactory");
+            final var runtimeMXBean = managementFactory == null ? null
+                    : ReflectionUtils.invokeStaticMethod(/* throwException = */ false, managementFactory,
+                            "getRuntimeMXBean");
+            @SuppressWarnings("unchecked")
+            final var commandlineArguments = runtimeMXBean == null ? null
+                    : (List<String>) ReflectionUtils.invokeMethod(/* throwException = */ false, runtimeMXBean,
+                            "getInputArguments");
+            if (commandlineArguments != null) {
+                for (final String arg : commandlineArguments) {
+                    for (final ModulePathSwitch modulePathSwitch : modulePathSwitches) {
+                        if (arg.startsWith(modulePathSwitch.argSwitch())) {
+                            modulePathSwitch.addArgParam(arg.substring(modulePathSwitch.argSwitch().length()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Return the module path info in command line format.
+     *
+     * @return the module path command line string.
+     */
+    @Override
+    public synchronized String toString() {
+        readCommandLineArguments();
+        final StringBuilder buf = new StringBuilder(1024);
+        for (final ModulePathSwitch modulePathSwitch : modulePathSwitches) {
+            final var values = modulePathSwitch.values();
+            if (values.isEmpty()) {
+                continue;
+            }
+            if (modulePathSwitch.argPartSeparatorChar() == '\0') {
+                // The switch takes a single value, so it is repeated once per value
+                for (final String value : values) {
+                    if (!buf.isEmpty()) {
+                        buf.append(' ');
+                    }
+                    buf.append(modulePathSwitch.argSwitch()).append(value);
+                }
+            } else {
+                if (!buf.isEmpty()) {
+                    buf.append(' ');
+                }
+                buf.append(modulePathSwitch.argSwitch())
+                        .append(StringUtils.join(String.valueOf(modulePathSwitch.argPartSeparatorChar()), values));
+            }
+        }
+        return buf.toString();
+    }
+}

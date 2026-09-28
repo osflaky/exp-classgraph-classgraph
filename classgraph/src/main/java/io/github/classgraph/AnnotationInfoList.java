@@ -1,0 +1,451 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph;
+
+import java.lang.annotation.Annotation;
+import java.lang.annotation.Inherited;
+import java.lang.annotation.Repeatable;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Predicate;
+
+import io.github.classgraph.ClassInfo.RelType;
+import io.github.classgraph.base.LogNode;
+import io.github.classgraph.base.internal.utils.Assert;
+import io.github.classgraph.base.internal.utils.CollectionUtils;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * A list of {@link AnnotationInfo} objects, which stores both the reachable annotations (annotations that are
+ * either directly present on the annotated item, or reached indirectly through a meta-annotation, or inherited from
+ * a superclass or interface that was annotated with {@link java.lang.annotation.Inherited @Inherited}), and the
+ * directly present annotations. (By default, accessing an {@link AnnotationInfoList} as a {@link List} returns the
+ * reachable annotations; by calling {@link #directOnly()}, you can get only the directly present annotations.)
+ *
+ * <p>
+ * Equality is {@link List} equality: two lists are equal if they hold equal annotations in the same order. Which of
+ * the annotations are directly present is reported by {@link #directOnly()}, and is not part of the comparison, so
+ * two lists that hold the same annotations are equal even when they were reached in different ways.
+ */
+public final class AnnotationInfoList extends MappableInfoList<AnnotationInfo> {
+    /**
+     * The annotations that are directly present on the annotated item, rather than reached through a
+     * meta-annotation or inherited, or null if this list holds only directly present annotations. See
+     * {@link #directOnly()}.
+     */
+    private final @Nullable AnnotationInfoList directlyRelatedAnnotations;
+
+    /** An unmodifiable empty {@link AnnotationInfoList}. */
+    static final AnnotationInfoList EMPTY_LIST = new AnnotationInfoList(List.of());
+
+    /**
+     * Return an unmodifiable empty {@link AnnotationInfoList}.
+     *
+     * @return the unmodifiable empty {@link AnnotationInfoList}.
+     */
+    public static AnnotationInfoList emptyList() {
+        return EMPTY_LIST;
+    }
+
+    /**
+     * Construct a new unmodifiable {@link AnnotationInfoList} from a completed collection of {@link AnnotationInfo}
+     * objects. The collection is copied, and the annotations are sorted by name.
+     *
+     * @param annotationInfoCollection
+     *            the annotations to add to the list. All of them are treated as directly present on the annotated
+     *            item, rather than as meta-annotations.
+     */
+    public AnnotationInfoList(final Collection<AnnotationInfo> annotationInfoCollection) {
+        this(CollectionUtils.sortCopy(
+                Objects.requireNonNull(annotationInfoCollection, "annotationInfoCollection must not be null")));
+    }
+
+    /**
+     * Constructor for a list all of whose annotations are treated as directly present on the annotated item. As in
+     * {@link InfoList#InfoList(List)}, this list claims the given list, and the caller is responsible for having
+     * sorted it.
+     *
+     * @param annotationInfo
+     *            the annotations to add to the list
+     */
+    AnnotationInfoList(final List<AnnotationInfo> annotationInfo) {
+        super(annotationInfo);
+        // If only reachable annotations are given, treat all of them as direct
+        directlyRelatedAnnotations = this;
+    }
+
+    /**
+     * Constructor for two lists that the caller has already ordered.
+     *
+     * @param reachableAnnotations
+     *            the reachable annotations
+     * @param directlyRelatedAnnotations
+     *            the directly related annotations, or null if this is already a list of direct annotations
+     */
+    AnnotationInfoList(final AnnotationInfoList reachableAnnotations,
+            final @Nullable AnnotationInfoList directlyRelatedAnnotations) {
+        super(reachableAnnotations);
+        this.directlyRelatedAnnotations = directlyRelatedAnnotations;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Find the subset of the {@link AnnotationInfo} objects in this list for which the given filter predicate is
+     * true.
+     *
+     * @param filter
+     *            The filter to apply. Only the {@link AnnotationInfo} objects for which the filter returns true are
+     *            copied to the returned list.
+     * @return The subset of the {@link AnnotationInfo} objects in this list for which the given filter predicate is
+     *         true.
+     */
+    public AnnotationInfoList filter(final Predicate<AnnotationInfo> filter) {
+        Assert.notNull(filter, "filter");
+        final List<AnnotationInfo> reachableFiltered = new ArrayList<>();
+        final var directAnnotations = directlyRelatedAnnotations;
+        final List<AnnotationInfo> directlyRelatedFiltered = directAnnotations == null ? null : new ArrayList<>();
+        for (final AnnotationInfo annotationInfo : this) {
+            if (filter.test(annotationInfo)) {
+                reachableFiltered.add(annotationInfo);
+                if (directAnnotations != null && directlyRelatedFiltered != null
+                        && directAnnotations.contains(annotationInfo)) {
+                    directlyRelatedFiltered.add(annotationInfo);
+                }
+            }
+        }
+        // Filtering preserves the order of this list, which is already sorted, so don't sort again
+        final var reachableResult = new AnnotationInfoList(reachableFiltered);
+        return directlyRelatedFiltered == null ? reachableResult
+                : new AnnotationInfoList(reachableResult, new AnnotationInfoList(directlyRelatedFiltered));
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get {@link ClassInfo} objects for any classes referenced in this list.
+     *
+     * @param classNameToClassInfo
+     *            the map to add a {@link ClassInfo} object to, for a referenced class that has none in the scan
+     *            result.
+     * @param refdClassInfo
+     *            the referenced class info
+     * @param log
+     *            the log node, or null to skip logging
+     */
+    void findReferencedClassInfo(final Map<String, ClassInfo> classNameToClassInfo,
+            final Set<ClassInfo> refdClassInfo, final @Nullable LogNode log) {
+        for (final AnnotationInfo ai : this) {
+            ai.findReferencedClassInfo(classNameToClassInfo, refdClassInfo, log);
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Handle {@link Repeatable} annotations.
+     *
+     * @param annotations
+     *            the annotations to search for repeatable annotations
+     * @param allRepeatableAnnotationNames
+     *            the names of all repeatable annotations
+     * @param containingClassInfo
+     *            the containing class
+     * @param forwardRelType
+     *            the forward relationship type for linking
+     * @param reverseRelType0
+     *            the first reverse relationship type for linking
+     * @param reverseRelType1
+     *            the second reverse relationship type for linking (or null for none)
+     */
+    static void handleRepeatableAnnotations(final List<AnnotationInfo> annotations,
+            final Set<String> allRepeatableAnnotationNames, final @Nullable ClassInfo containingClassInfo,
+            final RelType forwardRelType, final RelType reverseRelType0, final @Nullable RelType reverseRelType1) {
+        List<AnnotationInfo> repeatableAnnotations = null;
+        for (var i = annotations.size() - 1; i >= 0; --i) {
+            final var ai = annotations.get(i);
+            if (allRepeatableAnnotationNames.contains(ai.getName())) {
+                if (repeatableAnnotations == null) {
+                    repeatableAnnotations = new ArrayList<>();
+                }
+                repeatableAnnotations.add(ai);
+                // Remove repeatable annotation
+                annotations.remove(i);
+            }
+        }
+        // Add the component annotations in each of the parameters of the repeatable annotation
+        if (repeatableAnnotations != null) {
+            for (final AnnotationInfo repeatableAnnotation : repeatableAnnotations) {
+                final var values = repeatableAnnotation.getParameterValues();
+                if (!values.isEmpty()) {
+                    final var apv = values.get("value");
+                    if (apv != null) {
+                        final var arr = apv.getValue();
+                        if (arr instanceof final Object[] arrValues) {
+                            for (final Object value : arrValues) {
+                                if (value instanceof final AnnotationInfo ai) {
+                                    annotations.add(ai);
+
+                                    // Link annotation
+                                    final var annotationClass = ai.getClassInfo();
+                                    if (annotationClass != null) {
+                                        final var containingClass = Objects.requireNonNull(containingClassInfo);
+                                        containingClass.addRelatedClass(forwardRelType, annotationClass);
+                                        annotationClass.addRelatedClass(reverseRelType0, containingClass);
+                                        if (reverseRelType1 != null) {
+                                            annotationClass.addRelatedClass(reverseRelType1, containingClass);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * How directly an annotation is related to the annotated class, method, method parameter or field: it is
+     * directly present on it, or it is inherited from a superclass, or it is a meta-annotation on one of the other
+     * two. The same annotation can be reached in more than one of these ways, and the most direct of them is the
+     * one that should be reported.
+     */
+    // #559
+    private enum Directness {
+        /** The annotation is directly present on the annotated element. */
+        DIRECTLY_PRESENT,
+
+        /** The annotation is {@link Inherited} from a superclass. */
+        INHERITED,
+
+        /** The annotation is a meta-annotation of another annotation. */
+        META_ANNOTATION
+    }
+
+    /**
+     * Add a reachable annotation to a list, unless the same annotation was already reached by a route at least as
+     * direct.
+     *
+     * @param ai
+     *            the annotation
+     * @param directness
+     *            how directly the annotation is related to the annotated element
+     * @param reachableAnnotationOut
+     *            the list of reachable annotations
+     * @param directnessOut
+     *            the map from annotation to how directly it is related to the annotated element
+     */
+    // #559
+    private static void addReachableAnnotation(final AnnotationInfo ai, final Directness directness,
+            final List<AnnotationInfo> reachableAnnotationOut,
+            final Map<AnnotationInfo, Directness> directnessOut) {
+        final var prevDirectness = directnessOut.get(ai);
+        if (prevDirectness == null) {
+            directnessOut.put(ai, directness);
+            reachableAnnotationOut.add(ai);
+        } else if (directness.compareTo(prevDirectness) < 0) {
+            directnessOut.put(ai, directness);
+        }
+    }
+
+    /**
+     * Find the transitive closure of meta-annotations.
+     *
+     * @param ai
+     *            the annotationInfo object
+     * @param allAnnotationsOut
+     *            annotations out
+     * @param visited
+     *            visited
+     * @param directnessOut
+     *            the map from annotation to how directly it is related to the annotated element
+     */
+    private static void findMetaAnnotations(final AnnotationInfo ai, final List<AnnotationInfo> allAnnotationsOut,
+            final Set<ClassInfo> visited, final Map<AnnotationInfo, Directness> directnessOut) {
+        final var annotationClassInfo = ai.getClassInfo();
+        if (annotationClassInfo != null && annotationClassInfo.annotationInfo != null
+        // Don't get in a cycle
+                && visited.add(annotationClassInfo)) {
+            for (final AnnotationInfo metaAnnotationInfo : annotationClassInfo.annotationInfo) {
+                // N.B. read the class name from the AnnotationInfo rather than from its ClassInfo, since ClassInfo
+                // is null if the meta-annotation's class was not encountered during the scan
+                final var metaAnnotationClassName = metaAnnotationInfo.getName();
+                // Don't treat java.lang.annotation annotations as meta-annotations
+                if (!metaAnnotationClassName.startsWith("java.lang.annotation.")) {
+                    // Add the meta-annotation to the transitive closure
+                    addReachableAnnotation(metaAnnotationInfo, Directness.META_ANNOTATION, allAnnotationsOut,
+                            directnessOut);
+                    // Recurse to meta-meta-annotation
+                    findMetaAnnotations(metaAnnotationInfo, allAnnotationsOut, visited, directnessOut);
+                }
+            }
+        }
+    }
+
+    /**
+     * Get the indirect annotations on a class (meta-annotations and/or inherited annotations).
+     *
+     * @param directAnnotationInfo
+     *            the direct annotations on the class, method, method parameter or field.
+     * @param annotatedClass
+     *            for class annotations, this is the annotated class, else null.
+     * @return the indirect annotations
+     */
+    static AnnotationInfoList getIndirectAnnotations(final @Nullable List<AnnotationInfo> directAnnotationInfo,
+            final @Nullable ClassInfo annotatedClass) {
+        // Add direct annotations
+        final Set<ClassInfo> directOrInheritedAnnotationClasses = new HashSet<>();
+        final Set<ClassInfo> reachedAnnotationClasses = new HashSet<>();
+        final List<AnnotationInfo> reachableAnnotationInfo = new ArrayList<>(
+                directAnnotationInfo == null ? 2 : directAnnotationInfo.size());
+        // Record how directly each annotation is related to the annotated element, so that an annotation that is
+        // reached in more than one way is listed only once, and is sorted according to the most direct of those
+        // ways #559
+        final Map<AnnotationInfo, Directness> directness = new IdentityHashMap<>();
+        if (directAnnotationInfo != null) {
+            for (final AnnotationInfo dai : directAnnotationInfo) {
+                directOrInheritedAnnotationClasses.add(dai.getClassInfo());
+                addReachableAnnotation(dai, Directness.DIRECTLY_PRESENT, reachableAnnotationInfo, directness);
+                findMetaAnnotations(dai, reachableAnnotationInfo, reachedAnnotationClasses, directness);
+            }
+        }
+        if (annotatedClass != null) {
+            // Add any @Inherited annotations on superclasses
+            for (final ClassInfo superclass : annotatedClass.allSuperclassesIncludingExternal()) {
+                if (superclass.annotationInfo != null) {
+                    for (final AnnotationInfo sai : superclass.annotationInfo) {
+                        // Don't add inherited superclass annotation if it is overridden in a subclass
+                        if (sai.isInherited() && directOrInheritedAnnotationClasses.add(sai.getClassInfo())) {
+                            addReachableAnnotation(sai, Directness.INHERITED, reachableAnnotationInfo, directness);
+                            final List<AnnotationInfo> reachableMetaAnnotationInfo = new ArrayList<>(2);
+                            findMetaAnnotations(sai, reachableMetaAnnotationInfo, reachedAnnotationClasses,
+                                    new IdentityHashMap<>());
+                            // Meta-annotations also have to have @Inherited to be inherited
+                            for (final AnnotationInfo rmai : reachableMetaAnnotationInfo) {
+                                if (rmai.isInherited()) {
+                                    addReachableAnnotation(rmai, Directness.META_ANNOTATION,
+                                            reachableAnnotationInfo, directness);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Return sorted annotation list
+        // Sort by name, then put the most directly related of any annotations that share a name first, so that
+        // AnnotationInfoList#get(String) returns the annotation that is directly present on the annotated element,
+        // if there is one #559
+        CollectionUtils.sortIfNotEmpty(reachableAnnotationInfo,
+                Comparator.comparing(AnnotationInfo::getName).thenComparing(
+                        (final AnnotationInfo ai) -> directness.getOrDefault(ai, Directness.META_ANNOTATION))
+                        .thenComparing(Comparator.naturalOrder()));
+        // The reachable annotations have just been sorted into an order that the AnnotationInfoList constructor
+        // cannot produce, so don't let the constructor sort them again; the direct annotations are sorted by the
+        // constructor, since they only need to be in name order
+        return new AnnotationInfoList(new AnnotationInfoList(reachableAnnotationInfo),
+                new AnnotationInfoList(directAnnotationInfo == null ? List.<AnnotationInfo> of()
+                        : CollectionUtils.sortCopy(directAnnotationInfo)));
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get the list of direct annotations, excluding meta-annotations. If this {@link AnnotationInfoList} consists
+     * of class annotations, i.e. if it was produced using {@link ClassInfo#getAllAnnotationInfo()}, then the
+     * returned list also excludes annotations inherited from a superclass or implemented interface that was
+     * annotated with {@link java.lang.annotation.Inherited @Inherited}.
+     *
+     * @return The list of directly-related annotations.
+     */
+    public AnnotationInfoList directOnly() {
+        // If directlyRelatedAnnotations == null, this is already a list of direct annotations (the list of
+        // AnnotationInfo objects created when the classfile is read). Otherwise return a new list consisting of
+        // only the direct annotations.
+        return this.directlyRelatedAnnotations == null ? this
+                // Make .directOnly() idempotent
+                : new AnnotationInfoList(directlyRelatedAnnotations, /* directlyRelatedAnnotations = */ null);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get the {@link Repeatable} annotation with the given class, or the empty list if none found.
+     *
+     * @param annotationClass
+     *            The class to search for.
+     * @return The list of annotations with the given class, or the empty list if none found.
+     * @throws IllegalArgumentException
+     *             if {@code annotationClass} is not an annotation type.
+     */
+    public AnnotationInfoList getRepeatable(final Class<? extends Annotation> annotationClass) {
+        Assert.notNull(annotationClass, "annotationClass");
+        Assert.isAnnotation(annotationClass);
+        return getRepeatable(annotationClass.getName());
+    }
+
+    /**
+     * Get the {@link Repeatable} annotation with the given name, or the empty list if none found.
+     *
+     * @param name
+     *            The name to search for.
+     * @return The list of annotations with the given name, or the empty list if none found.
+     */
+    public AnnotationInfoList getRepeatable(final String name) {
+        Assert.notNull(name, "name");
+        var hasNamedAnnotation = false;
+        for (final AnnotationInfo ai : this) {
+            if (ai.getName().equals(name)) {
+                hasNamedAnnotation = true;
+                break;
+            }
+        }
+        if (!hasNamedAnnotation) {
+            return AnnotationInfoList.EMPTY_LIST;
+        }
+        final List<AnnotationInfo> matchingAnnotations = new ArrayList<>();
+        for (final AnnotationInfo ai : this) {
+            if (ai.getName().equals(name)) {
+                matchingAnnotations.add(ai);
+            }
+        }
+        // The matching annotations are a subsequence of this list, which is already sorted
+        return new AnnotationInfoList(matchingAnnotations);
+    }
+}
