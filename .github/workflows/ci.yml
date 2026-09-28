@@ -1,0 +1,43 @@
+name: Java CI
+
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        java: ['17', '18', '19', '20', '21', '22', '23', '24', '25', '26']
+        include:
+          # Windows on arm64, with the LTS releases that Zulu builds for it
+        - {os: windows-11-arm, java: '17'}
+        - {os: windows-11-arm, java: '21'}
+        - {os: windows-11-arm, java: '25'}
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'zulu'
+        java-version: ${{ matrix.java }}
+        # Cache ~/.m2/repository and (as a separate entry, keyed on
+        # .mvn/wrapper/maven-wrapper.properties) ~/.m2/wrapper/dists, so that the Maven
+        # distribution and the dependencies are not re-downloaded by all 30 matrix jobs on
+        # every run. repo.maven.apache.org rate-limits (HTTP 429), which has failed builds.
+        cache: 'maven'
+    - name: print Java version
+      run: java -version
+    - name: Build with Maven
+      run: ./mvnw --no-transfer-progress -B clean test
+
+  # The formatter is bound to process-sources with the "format" goal, so every build rewrites the
+  # sources in place rather than complaining. That is deliberate, and it keeps the tree formatted
+  # without anyone having to think about it, but it means no build can catch source that was edited
+  # and pushed without being built locally: CI reformats its own checkout, goes green, and the
+  # misformatted version stays in git for the next person to build over. "validate" is the same
+  # check without the rewrite, which is what turns the formatter into a gate. It runs on Linux
+  # only: there is no .gitattributes, so a Windows checkout converts the sources to CRLF and every
+  # file would then fail the <lineEnding>LF</lineEnding> the formatter is configured with.
+    timeout-minutes: 150
