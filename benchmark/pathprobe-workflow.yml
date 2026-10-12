@@ -1,0 +1,59 @@
+name: Path handling probe
+
+# Not an active workflow -- it is kept here, outside .github/workflows, so that it does not run on
+# every push. To run the path probe on all three operating systems again, copy this file into
+# .github/workflows, push the branch named below, compare the artifacts, then remove it again.
+#
+# The probe records what each operating system actually does with the path and URL forms ClassGraph
+# has to handle, and what FastPathResolver makes of the same inputs, so that the resolver's platform
+# assumptions can be checked rather than inferred. The test suite itself already runs on all three
+# operating systems in ci.yml, so it is not repeated here.
+on:
+  push:
+    branches:
+      - path-probe
+
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        java: [ '17', '25' ]
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'zulu'
+        java-version: ${{ matrix.java }}
+        cache: 'maven'
+    - name: Build ClassGraph
+      run: ./mvnw --no-transfer-progress -B -q clean compile
+    - name: Run the path probe
+      shell: bash
+      # The probe's output is UTF-8, and the Windows console is not, so force the encoding
+      run: |
+        # ClassGraph is a multi-module build, so its classes are under each module's target/classes,
+        # and there is no target/classes at the repository root. Windows java.exe wants ";" between
+        # classpath entries even when the step is run under bash.
+        SEP=":"
+        if [ "$RUNNER_OS" = "Windows" ] ; then SEP=";" ; fi
+        CP="classgraph/target/classes${SEP}classgraph-base/target/classes"
+        CP="${CP}${SEP}classgraph-vfs/target/classes${SEP}classgraph-classpath/target/classes"
+        java -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -cp "$CP" benchmark/PathProbe.java \
+            | tee "probe-$RUNNER_OS-${{ matrix.java }}.txt"
+    - name: Save the output, so the platforms can be diffed against each other
+      if: always()
+      uses: actions/upload-artifact@v5
+      with:
+        name: probe-${{ matrix.os }}-${{ matrix.java }}
+        path: probe-*.txt
+    - name: Fail the job if any end-to-end check did not pass
+      shell: bash
+      # The probe prints "failures<tab><count>". Matched with awk rather than grep, so that this file
+      # holds no literal tab character: a tab in a plain YAML scalar is legal in YAML 1.2 but not in
+      # YAML 1.1, and an editor that expands tabs on save would silently turn the check into one that
+      # can never match.
+      run: awk -F'\t' '$1 == "failures" && $2 == "0" { ok = 1 } END { exit !ok }' "probe-$RUNNER_OS-${{ matrix.java }}.txt"

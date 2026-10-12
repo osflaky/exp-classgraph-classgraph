@@ -1,0 +1,397 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph.base.internal.path;
+
+import java.io.IOError;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.Locale;
+import java.util.regex.Pattern;
+
+import io.github.classgraph.base.internal.utils.VersionFinder;
+import io.github.classgraph.base.internal.utils.VersionFinder.OperatingSystem;
+
+/**
+ * The URL end of a path: percent-encoding and decoding the path part of a URL, normalizing it, and reading and
+ * normalizing the scheme that a path may begin with.
+ */
+public final class URLPaths {
+    /**
+     * A URL scheme and its trailing {@code ':'} at the start of a path. At least two characters are required, so
+     * that a Windows drive designation is not taken for a URL scheme.
+     */
+    private static final Pattern URL_SCHEME_PREFIX_PATTERN = Pattern.compile("^[a-zA-Z][a-zA-Z0-9+\\-.]+:");
+
+    /** A URL scheme on its own, without the trailing {@code ':'}. */
+    private static final Pattern URL_SCHEME_NAME_PATTERN = Pattern.compile("[a-zA-Z][a-zA-Z0-9+\\-.]+");
+
+    /** Whether an ASCII character is URL-safe. */
+    private static final boolean[] safe = new boolean[256];
+
+    static {
+        for (int i = 'a'; i <= 'z'; i++) {
+            safe[i] = true;
+        }
+        for (int i = 'A'; i <= 'Z'; i++) {
+            safe[i] = true;
+        }
+        for (int i = '0'; i <= '9'; i++) {
+            safe[i] = true;
+        }
+        // "safe" rule
+        safe['$'] = safe['-'] = safe['_'] = safe['.'] = safe['+'] = true;
+        // "extra" rule
+        safe['!'] = safe['*'] = safe['\''] = safe['('] = safe[')'] = safe[','] = true;
+        // Only include "/" from "fsegment" and "hsegment" rules (exclude ':', '@', '&' and '=' for safety)
+        safe['/'] = true;
+    }
+
+    /** Hexadecimal digits. */
+    private static final char[] HEXADECIMAL = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c',
+            'd', 'e', 'f' };
+
+    /** Valid classpath URL scheme prefixes. */
+    private static final String[] SCHEME_PREFIXES = { "jrt:", "file:", "jar:file:", "jar:", "http:", "https:" };
+
+    /** Not instantiable. */
+    private URLPaths() {
+        // Cannot be constructed
+    }
+
+    /**
+     * Check that a string is a URL scheme name, and lowercase it, since URL schemes are case-insensitive but are
+     * matched in lowercase.
+     *
+     * @param scheme
+     *            the scheme, e.g. "http", without the trailing ':'.
+     * @return the scheme, lowercased.
+     * @throws IllegalArgumentException
+     *             if the scheme is shorter than two characters, or is not a valid URL scheme.
+     */
+    public static String normalizeURLScheme(final String scheme) {
+        // The scheme is validated, rather than simply lowercased, because a scheme given in a form that can never
+        // match a URL, e.g. with a trailing ':', would otherwise be accepted and silently have no effect
+        if (scheme.length() < 2) {
+            // A one-character scheme cannot be told apart from a Windows drive letter
+            throw new IllegalArgumentException("URL schemes must contain at least two characters");
+        }
+        if (!URL_SCHEME_NAME_PATTERN.matcher(scheme).matches()) {
+            throw new IllegalArgumentException("Not a valid URL scheme: \"" + scheme + "\"");
+        }
+        return scheme.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Check whether a path begins with something shaped like a URL scheme: a letter, then at least one more letter,
+     * digit, {@code '+'}, {@code '-'} or {@code '.'}, then {@code ':'}. This looks at syntax only. Since
+     * {@code ':'} is a legal filename character off Windows, a relative path can be spelled like a URL, and
+     * {@link PathSyntax#hasURLScheme(String)} consults the filesystem to tell the two apart.
+     *
+     * @param path
+     *            the path.
+     * @return true if the path begins with a URL scheme followed by {@code ':'}.
+     */
+    public static boolean startsWithURLScheme(final String path) {
+        return URL_SCHEME_PREFIX_PATTERN.matcher(path).find();
+    }
+
+    /**
+     * Encode a URL path using percent-encoding. '/' is not encoded.
+     *
+     * @param path
+     *            The path to encode.
+     * @return The encoded path.
+     */
+    public static String encodePath(final String path) {
+        // Accept ':' if it is part of a scheme prefix
+        var validColonPrefixLen = 0;
+        for (final String scheme : SCHEME_PREFIXES) {
+            if (path.startsWith(scheme)) {
+                validColonPrefixLen = scheme.length();
+                break;
+            }
+        }
+        // Also accept ':' after a Windows drive letter
+        if (VersionFinder.OS == OperatingSystem.Windows) {
+            var i = validColonPrefixLen;
+            if (i < path.length() && path.startsWith("///", i)) {
+                i += "///".length();
+            }
+            if (i < path.length() - 1 && Character.isLetter(path.charAt(i)) && path.charAt(i + 1) == ':') {
+                validColonPrefixLen = i + 2;
+            }
+        }
+
+        // Apply URL encoding rules to rest of path
+        final var pathBytes = path.getBytes(StandardCharsets.UTF_8);
+        final StringBuilder encodedPath = new StringBuilder(pathBytes.length * 3);
+        for (var i = 0; i < pathBytes.length; i++) {
+            final var pathByte = pathBytes[i];
+            final var b = pathByte & 0xff;
+            if (safe[b] || (b == ':' && i < validColonPrefixLen)) {
+                encodedPath.append((char) b);
+            } else {
+                encodedPath.append('%');
+                encodedPath.append(HEXADECIMAL[(b & 0xf0) >> 4]);
+                encodedPath.append(HEXADECIMAL[b & 0x0f]);
+            }
+        }
+        return encodedPath.toString();
+    }
+
+    /**
+     * Test whether a character is a hexadecimal digit, i.e. whether it can be one of the two digits of a percent
+     * escape.
+     *
+     * @param c
+     *            the character.
+     * @return true if the character is a hexadecimal digit.
+     */
+    private static boolean isHexDigit(final char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
+    /**
+     * Percent-encode only the characters that a URI cannot hold, leaving the rest of a URL as it is written.
+     *
+     * <p>
+     * This is what a path that is still a URL needs, as opposed to a file path: a URL is already percent-encoded,
+     * so {@link #encodePath(String)} would encode it a second time and turn {@code "%20"} into {@code "%2520"},
+     * naming a resource that does not exist. It would also escape the URL's own syntax -- the colon before a port
+     * number becomes {@code "%3a"}, which makes the authority name a host that does not exist, and the {@code '?'}
+     * of a query string becomes {@code "%3f"}.
+     *
+     * <p>
+     * An escape that is already written is therefore kept as it is, and only a lone {@code '%'} that does not
+     * introduce one is escaped. What is escaped besides that is what {@link URI} rejects: a space, a control
+     * character, a character outside ASCII, and the handful of ASCII characters that no part of a URI may hold.
+     *
+     * @param url
+     *            the URL.
+     * @return the URL, with the characters a URI cannot hold percent-encoded.
+     */
+    private static String encodeURL(final String url) {
+        final StringBuilder buf = new StringBuilder(url.length() + 16);
+        for (var i = 0; i < url.length(); i++) {
+            final var c = url.charAt(i);
+            if (c == '%' && i < url.length() - 2 && isHexDigit(url.charAt(i + 1))
+                    && isHexDigit(url.charAt(i + 2))) {
+                // An escape that is already written is part of the URL, and is not encoded a second time
+                buf.append(url, i, i + 3);
+                i += 2;
+            } else if (c > ' ' && c < 0x7f && "\"<>\\^`{|}%".indexOf(c) < 0) {
+                buf.append(c);
+            } else {
+                // Percent-encode the UTF-8 bytes of everything a URI cannot hold. A character outside the Basic
+                // Multilingual Plane is stored as a surrogate pair, and the two surrogates only encode as UTF-8
+                // together, so the whole code point is taken rather than one char
+                final var codePoint = url.codePointAt(i);
+                i += Character.charCount(codePoint) - 1;
+                for (final byte b : Character.toString(codePoint).getBytes(StandardCharsets.UTF_8)) {
+                    buf.append('%').append(HEXADECIMAL[(b & 0xf0) >> 4]).append(HEXADECIMAL[b & 0x0f]);
+                }
+            }
+        }
+        return buf.toString();
+    }
+
+    /**
+     * Move the server of a UNC path out of the authority of a {@code "file:"} URI and back into its path, so that
+     * the URI names the same file after it is converted to a {@link java.net.URL} and opened.
+     *
+     * <p>
+     * {@link java.nio.file.Path#toUri()} renders the UNC path {@code \\server\share\x} as
+     * {@code file://server/share/x}, putting the server in the URI authority. {@link java.net.URL} reads that back
+     * as the local path {@code \share\x}, dropping the server, so opening it fails or, worse, reads a different
+     * file. {@link java.io.File#toURI()} renders the same path as {@code file:////server/share/x}, with an empty
+     * authority and the server in the path, and that does read back as the UNC path it came from. Both spellings
+     * are permitted (RFC 8089 appendix E.3.2); only the second one round-trips.
+     *
+     * <p>
+     * A URI with no authority is returned unchanged, so this is a no-op for every path that is not a UNC path.
+     *
+     * @param uri
+     *            the URI
+     * @return the URI, with any UNC server moved from the authority into the path
+     */
+    public static URI moveUNCServerIntoPath(final URI uri) {
+        final var authority = uri.getRawAuthority();
+        if (authority == null || authority.isEmpty() || !"file".equals(uri.getScheme())) {
+            return uri;
+        }
+        final var path = uri.getRawPath();
+        return URI.create("file:////" + authority + (path == null ? "" : path));
+    }
+
+    /**
+     * Normalize a URL path, so that it can be fed into the URL or URI constructor.
+     *
+     * @param urlPath
+     *            the URL path
+     * @return the URL string
+     */
+    public static String normalizeURLPath(final String urlPath) {
+        if (urlPath.startsWith("jrt:") || urlPath.startsWith("http://") || urlPath.startsWith("https://")) {
+            // These schemes do not name a file, so there is no file path to normalize, and what is left is still a
+            // URL: FastPathResolver keeps the percent encoding of a URL rather than decoding it, so encoding it
+            // again here would name a resource on a host that does not exist. Only what a URI cannot hold is
+            // escaped
+            final var url = encodeURL(urlPath);
+            // A "!/" separates a jarfile from a path within it whatever the jarfile is fetched over, so a jarfile
+            // nested inside a jarfile that was fetched over http is named by a "jar:" URL, exactly as a nested
+            // jarfile on the local filesystem is
+            return PathSyntax.indexOfNestedJarSeparator(url) < 0 ? url
+                    : "jar:" + PathSyntax.toJarUrlSeparators(url);
+        }
+        var urlPathNormalized = stripJarAndFilePrefixes(urlPath);
+
+        // A '!' is only a nested jar separator if it really separates a jarfile from a path within it -- it is an
+        // ordinary filename character otherwise, and a path such as "/dir!bang/x.jar" must not be rewritten to
+        // "/dir!/bang/x.jar", which names a different file and cannot be opened. Every separator that is one has to
+        // be spelled "!/" here, since that is what the "jar:" URL scheme requires
+        // #903
+        final var hasNestedJarSeparator = PathSyntax.indexOfNestedJarSeparator(urlPathNormalized) >= 0;
+        if (hasNestedJarSeparator) {
+            urlPathNormalized = PathSyntax.toJarUrlSeparators(urlPathNormalized);
+        }
+
+        urlPathNormalized = toFileURL(urlPathNormalized);
+
+        // Prepend "jar:" if the path really does name something nested inside a jarfile
+        if (hasNestedJarSeparator) {
+            urlPathNormalized = "jar:" + urlPathNormalized;
+        }
+        return encodePath(urlPathNormalized);
+    }
+
+    /**
+     * Form the {@link URI} of a path, normalizing and percent-encoding it first, so that a path containing a
+     * character that a URI cannot hold, or a {@code "!/"} section that names something nested inside a jarfile,
+     * still produces a URI that names the same thing the path does.
+     *
+     * @param path
+     *            the path
+     * @return the {@link URI} of the path
+     * @throws IllegalStateException
+     *             if the path could not be turned into a {@link URI}
+     */
+    public static URI toURI(final String path) {
+        final var normalized = normalizeURLPath(path);
+        try {
+            return new URI(normalized);
+        } catch (final URISyntaxException e) {
+            throw new IllegalStateException("Could not form URI for " + path + " : " + e, e);
+        }
+    }
+
+    /**
+     * Form the {@link URI} of a filesystem path, in the spelling that reads back as the path it came from.
+     *
+     * @param path
+     *            the path
+     * @return the {@link URI} of the path
+     * @throws IllegalStateException
+     *             if the path could not be turned into a {@link URI}
+     */
+    public static URI toURI(final Path path) {
+        try {
+            // On Windows, Path#toUri() puts the server of a UNC path in the URI authority, where java.net.URL does
+            // not find it again
+            return moveUNCServerIntoPath(path.toUri());
+        } catch (final IOError | SecurityException e) {
+            throw new IllegalStateException("Could not form URI for " + path + " : " + e, e);
+        }
+    }
+
+    /**
+     * Strip the {@code "jar:"} and {@code "file:"} scheme prefixes from a URL path, if present, leaving a plain
+     * file path.
+     *
+     * @param urlPath
+     *            the URL path.
+     * @return the path with the scheme prefixes removed.
+     */
+    private static String stripJarAndFilePrefixes(final String urlPath) {
+        var path = urlPath;
+        if (path.startsWith("jar:")) {
+            path = path.substring(4);
+        }
+        if (path.startsWith("file:")) {
+            path = path.substring(5);
+            // "file:" may be followed by an authority, which is not part of the path. Drop the two slashes that
+            // introduce it, so that the "file://" prefix added by toFileURL() cannot produce a path with a run of
+            // slashes in it, e.g. "file://///tmp/x.jar". Exactly two slashes are dropped, so that the remaining
+            // "//" of a UNC path is kept: "file:////server/share/x" leaves "//server/share/x", which names the
+            // share it came from, rather than the local path "/server/share/x", which does not
+            if (path.startsWith("///")) {
+                path = path.substring(2);
+            } else if (path.startsWith("//")) {
+                // Only two slashes, so what follows is either an authority naming the local machine or, in the
+                // spelling some classloaders use, the path itself. Either way one slash is enough
+                path = path.substring(1);
+            }
+        }
+        return path;
+    }
+
+    /**
+     * Turn a plain file path into a {@code "file:"} URL, prepending {@code "file:///"} to absolute paths and
+     * {@code "file:"} to relative paths.
+     *
+     * @param path
+     *            the file path.
+     * @return the {@code "file:"} URL.
+     */
+    private static String toFileURL(final String path) {
+        // On Windows, remove the drive prefix from the path, if present (otherwise the ':' after the drive letter
+        // would be escaped as %3A)
+        var windowsDrivePrefix = "";
+        var pathWithoutDrive = path;
+        if (VersionFinder.OS == OperatingSystem.Windows) {
+            if (path.length() >= 2 && Character.isLetter(path.charAt(0)) && path.charAt(1) == ':') {
+                // Path of form "C:/xyz"
+                windowsDrivePrefix = path.substring(0, 2);
+                pathWithoutDrive = path.substring(2);
+            } else if (path.length() >= 3 && path.charAt(0) == '/' && Character.isLetter(path.charAt(1))
+                    && path.charAt(2) == ':') {
+                // Path of form "/C:/xyz"
+                windowsDrivePrefix = path.substring(1, 3);
+                pathWithoutDrive = path.substring(3);
+            }
+        }
+        if (!windowsDrivePrefix.isEmpty()) {
+            // There is a Windows drive, so the path must be absolute
+            return "file:///" + windowsDrivePrefix + pathWithoutDrive;
+        }
+        // Absolute path: file:///xyz -- relative path: file:xyz
+        return pathWithoutDrive.startsWith("/") ? "file://" + pathWithoutDrive : "file:" + pathWithoutDrive;
+    }
+}

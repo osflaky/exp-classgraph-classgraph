@@ -1,0 +1,76 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph.features;
+
+import java.io.IOException;
+import java.net.URL;
+import java.net.URLConnection;
+import java.net.URLStreamHandler;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * CustomURLScheme.
+ */
+public class CustomURLScheme {
+    /** URL scheme. */
+    public static final String SCHEME = "customscheme";
+
+    /**
+     * A URL scheme with a digit in it, which RFC 3986 allows anywhere after the first character. Kept separate from
+     * {@link #SCHEME} so that tests can check that scheme recognition does not stop at the digit.
+     */
+    public static final String SCHEME_WITH_DIGIT = "customscheme9";
+
+    /** Any URLs that were remapped. */
+    public static Map<String, String> remappedURLs = new HashMap<>();
+
+    static {
+        URL.setURLStreamHandlerFactory(
+                protocol -> SCHEME.equals(protocol) || SCHEME_WITH_DIGIT.equals(protocol) ? new URLStreamHandler() {
+                    @Override
+                    protected URLConnection openConnection(final URL url) throws IOException {
+                        // Record that the URL was remapped, so we know this custom URLStreamHandler was called
+                        final var newURL = "file:" + url.getPath();
+                        remappedURLs.put(url.toString(), newURL);
+                        // Replace scheme with "file://"
+                        return new URL(newURL).openConnection();
+                    }
+                } : null);
+    }
+
+    /**
+     * Register the {@link URLStreamHandler} for {@link #SCHEME}. The registration is performed by the static
+     * initializer, and calling this method is what triggers it -- reading {@link #SCHEME} would not, because a
+     * constant of a primitive or {@link String} type is inlined into the caller at compile time.
+     */
+    public static void register() {
+        // Empty -- the work is done by the static initializer
+    }
+}

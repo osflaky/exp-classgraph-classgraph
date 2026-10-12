@@ -1,0 +1,327 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph;
+
+import java.lang.reflect.Modifier;
+import java.util.List;
+
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Holds metadata about class members of a class encountered during a scan. All values are taken directly out of the
+ * classfile for the class.
+ */
+public abstract class ClassMemberInfo extends ScanResultObject implements HasName, HasAnnotations {
+    /** The name of the class that declares this member. */
+    String declaringClassName;
+
+    /** The name of the class member. */
+    String name;
+
+    /** Class member modifiers. */
+    int modifiers;
+
+    /**
+     * The JVM-internal type descriptor (missing type parameters, but including types for synthetic and mandated
+     * class member parameters).
+     */
+    String typeDescriptorStr;
+
+    /**
+     * The type signature (may have type parameter information included, if present and available). Class member
+     * parameter types are unaligned.
+     */
+    @Nullable
+    String typeSignatureStr;
+
+    /** The annotations on the class member, in the order they were read, or null if none. */
+    @Nullable
+    List<AnnotationInfo> annotationInfo;
+
+    /** The annotation infos, once they are loaded */
+    private @Nullable AnnotationInfoList annotationInfoRef;
+
+    /**
+     * Constructor.
+     *
+     * @param definingClassName
+     *            The class the member is defined within.
+     * @param memberName
+     *            The name of the class member.
+     * @param modifiers
+     *            The class member modifiers.
+     * @param typeDescriptorStr
+     *            The class member type descriptor.
+     * @param typeSignatureStr
+     *            The class member type signature.
+     * @param annotationInfo
+     *            {@link AnnotationInfo} for any annotations on the class member.
+     */
+    ClassMemberInfo(final String definingClassName, final String memberName, final int modifiers,
+            final String typeDescriptorStr, final @Nullable String typeSignatureStr,
+            final @Nullable List<AnnotationInfo> annotationInfo) {
+        super();
+        this.declaringClassName = definingClassName;
+        this.name = memberName;
+        this.modifiers = modifiers;
+        this.typeDescriptorStr = typeDescriptorStr;
+        this.typeSignatureStr = typeSignatureStr;
+        this.annotationInfo = annotationInfo == null || annotationInfo.isEmpty() ? null : annotationInfo;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get the {@link ClassInfo} object for the class that declares this class member.
+     *
+     * @return The {@link ClassInfo} object for the declaring class.
+     *
+     * @see #getClassName()
+     */
+    @Override
+    public @Nullable ClassInfo getClassInfo() {
+        return super.getClassInfo();
+    }
+
+    /**
+     * Get the name of the class that declares this member.
+     *
+     * @return The name of the declaring class.
+     *
+     * @see #getClassInfo()
+     */
+    @Override
+    public String getClassName() {
+        return declaringClassName;
+    }
+
+    /**
+     * Get the name of the class member.
+     *
+     * @return The name of the class member.
+     */
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Returns the modifier bits for the class member.
+     *
+     * @return The modifier bits for the class member.
+     */
+    public int getModifiers() {
+        return modifiers;
+    }
+
+    /**
+     * Get the modifiers as a string, e.g. "public static final". For the modifier bits, call getModifiers().
+     *
+     * @return The modifiers, as a string.
+     */
+    public abstract String getModifiersString();
+
+    /**
+     * Returns true if this class member is public.
+     *
+     * @return True if the class member is public.
+     */
+    public boolean isPublic() {
+        return Modifier.isPublic(modifiers);
+    }
+
+    /**
+     * Returns true if this class member is private.
+     *
+     * @return True if the class member is private.
+     */
+    public boolean isPrivate() {
+        return Modifier.isPrivate(modifiers);
+    }
+
+    /**
+     * Returns true if this class member is protected.
+     *
+     * @return True if the class member is protected.
+     */
+    public boolean isProtected() {
+        return Modifier.isProtected(modifiers);
+    }
+
+    /**
+     * Returns true if this class member is static.
+     *
+     * @return True if the class member is static.
+     */
+    public boolean isStatic() {
+        return Modifier.isStatic(modifiers);
+    }
+
+    /**
+     * Returns true if this class member is final.
+     *
+     * @return True if the class member is final.
+     */
+    public boolean isFinal() {
+        return Modifier.isFinal(modifiers);
+    }
+
+    /**
+     * Returns true if this class member is synthetic.
+     *
+     * @return True if the class member is synthetic.
+     */
+    public boolean isSynthetic() {
+        return (modifiers & 0x1000) != 0;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Returns the parsed type descriptor for the class member, which will not include type parameters. If you need
+     * generic type parameters, call {@link #getTypeSignature()} instead.
+     *
+     * @return The parsed type descriptor string for the class member.
+     */
+    public abstract @Nullable HierarchicalTypeSignature getTypeDescriptor();
+
+    /**
+     * Returns the type descriptor string for the class member, which will not include type parameters. If you need
+     * generic type parameters, call {@link #getTypeSignatureString()} instead.
+     *
+     * @return The type descriptor string for the class member.
+     */
+    public String getTypeDescriptorString() {
+        return typeDescriptorStr;
+    }
+
+    /**
+     * Returns the parsed type signature for the class member, possibly including type parameters. If this returns
+     * null, indicating that no type signature information is available for this class member, call
+     * {@link #getTypeDescriptor()} instead.
+     *
+     * @return The parsed type signature for the class member, or null if not available.
+     * @throws IllegalArgumentException
+     *             if the class member type signature cannot be parsed (this should only be thrown in the case of
+     *             classfile corruption, or a compiler bug that causes an invalid type signature to be written to
+     *             the classfile).
+     */
+    public abstract @Nullable HierarchicalTypeSignature getTypeSignature();
+
+    /**
+     * Returns the type signature string for the class member, possibly including type parameters. If this returns
+     * null, indicating that no type signature information is available for this class member, call
+     * {@link #getTypeDescriptorString()} instead.
+     *
+     * @return The type signature string for the class member, or null if not available.
+     */
+    public @Nullable String getTypeSignatureString() {
+        return typeSignatureStr;
+    }
+
+    /**
+     * Returns the type signature for the class member, possibly including type parameters. If the type signature is
+     * null, indicating that no type signature information is available for this class member, returns the type
+     * descriptor instead.
+     *
+     * @return The parsed type signature for the class member, or if not available, the parsed type descriptor for
+     *         the class member.
+     */
+    public abstract @Nullable HierarchicalTypeSignature getTypeSignatureOrTypeDescriptor();
+
+    /**
+     * Returns the type signature string for the class member, possibly including type parameters. If the type
+     * signature string is null, indicating that no type signature information is available for this class member,
+     * returns the type descriptor string instead.
+     *
+     * @return The type signature string for the class member, or if not available, the type descriptor string for
+     *         the class member.
+     */
+    public String getTypeSignatureOrTypeDescriptorString() {
+        if (typeSignatureStr != null) {
+            return typeSignatureStr;
+        }
+        return typeDescriptorStr;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get a list of the annotations and meta-annotations on this class member, along with any annotation parameter
+     * values, wrapped in {@link AnnotationInfo} objects.
+     *
+     * @return A list of the annotations and meta-annotations on this class member, along with any annotation
+     *         parameter values, wrapped in {@link AnnotationInfo} objects, or the empty list if none.
+     * @throws IllegalStateException
+     *             if {@link ClassGraph#enableAnnotationInfo()} was not called before scanning.
+     */
+    @Override
+    public AnnotationInfoList getAllAnnotationInfo() {
+        synchronized (this) {
+            if (annotationInfoRef != null) {
+                return annotationInfoRef;
+            }
+
+            scanResult().scanSpec.checkAnnotationInfoEnabled();
+
+            annotationInfoRef = annotationInfo == null ? AnnotationInfoList.EMPTY_LIST
+                    : AnnotationInfoList.getIndirectAnnotations(annotationInfo, /* annotatedClass = */ null);
+            return annotationInfoRef;
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Get the classes referenced by this class member: the classes named in its type descriptor and type signature,
+     * the classes of the annotations on it, and, for a method, the classes of the annotations on its parameters and
+     * the exception types in its {@code throws} clause.
+     *
+     * <p>
+     * Unlike {@link ClassInfo#getClassDependencies()}, this does not require
+     * {@link ClassGraph#enableInterClassDependencies()} to have been called before scanning -- the dependencies are
+     * read from the type signature and annotations of this member, which are always available once
+     * {@link ClassGraph#enableFieldInfo()} or {@link ClassGraph#enableMethodInfo()} has been called.
+     *
+     * <p>
+     * As with {@link ClassInfo#getClassDependencies()}, {@code java.lang.Object} is left out, and so are classes
+     * outside the accepted packages unless {@link ClassGraph#enableExternalClasses()} was called before scanning.
+     * The declaring class is included if the member refers to it.
+     *
+     * @return A {@link ClassInfoList} of the classes referenced by this class member, or the empty list if none.
+     */
+    public ClassInfoList getClassDependencies() {
+        final var refdClassInfo = findReferencedClassInfo(/* log = */ null);
+        refdClassInfo.removeIf(classInfo -> !scanResult().isListedAsDependency(classInfo));
+        return new ClassInfoList(refdClassInfo, /* sortByName = */ true);
+    }
+
+}

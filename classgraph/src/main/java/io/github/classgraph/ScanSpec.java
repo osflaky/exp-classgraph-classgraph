@@ -1,0 +1,447 @@
+/*
+ * This file is part of ClassGraph.
+ *
+ * Author: Luke Hutchison
+ *
+ * Hosted at: https://github.com/classgraph/classgraph
+ *
+ * --
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 Luke Hutchison
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+ * OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package io.github.classgraph;
+
+import java.lang.reflect.Field;
+import java.time.Duration;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import io.github.classgraph.base.LogNode;
+import io.github.classgraph.base.internal.filter.AcceptReject.AcceptRejectLeafname;
+import io.github.classgraph.base.internal.filter.AcceptReject.AcceptRejectPrefix;
+import io.github.classgraph.base.internal.filter.AcceptReject.AcceptRejectWholeString;
+import io.github.classgraph.base.internal.filter.AcceptReject;
+import io.github.classgraph.classpath.internal.ClasspathSpec;
+import io.github.classgraph.vfs.VfsSpec;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * The scanning specification.
+ *
+ * <p>
+ * This holds the settings that the scanner itself reads. The settings that are read by the libraries the scanner is
+ * built on are held in the specs of those libraries, which are composed into this one: the classpath and module
+ * path to search is described by {@link #classpathSpec}, and how archives are read is described by
+ * {@link #vfsSpec}.
+ */
+class ScanSpec {
+    /** How the classpath and the module path are found. */
+    public final ClasspathSpec classpathSpec = new ClasspathSpec();
+
+    /** How jarfiles are read. */
+    public final VfsSpec vfsSpec = new VfsSpec();
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /** Package accept/reject criteria (with separator '.'). */
+    public final AcceptRejectWholeString packageAcceptReject = new AcceptRejectWholeString('.');
+
+    /**
+     * Package prefix accept/reject criteria, for recursive scanning (with separator '.', ending in '.').
+     */
+    public final AcceptRejectPrefix packagePrefixAcceptReject = new AcceptRejectPrefix('.');
+
+    /** Path accept/reject criteria (with separator '/'). */
+    public final AcceptRejectWholeString pathAcceptReject = new AcceptRejectWholeString('/');
+
+    /**
+     * Path prefix accept/reject criteria, for recursive scanning (with separator '/', ending in '/').
+     */
+    public final AcceptRejectPrefix pathPrefixAcceptReject = new AcceptRejectPrefix('/');
+
+    /**
+     * Class accept/reject criteria (fully-qualified class names, with separator '.').
+     */
+    public final AcceptRejectWholeString classAcceptReject = new AcceptRejectWholeString('.');
+
+    /**
+     * Classfile accept/reject criteria (path to classfiles, with separator '/', ending in ".class").
+     */
+    public final AcceptRejectWholeString classfilePathAcceptReject = new AcceptRejectWholeString('/');
+
+    /** Package containing accepted/rejected classes (with separator '.'). */
+    public final AcceptRejectWholeString classPackageAcceptReject = new AcceptRejectWholeString('.');
+
+    /** Path to accepted/rejected classes (with separator '/'). */
+    public final AcceptRejectWholeString classPackagePathAcceptReject = new AcceptRejectWholeString('/');
+
+    /** Jar accept/reject criteria (leafname only, ending in ".jar"). */
+    public final AcceptRejectLeafname jarAcceptReject = new AcceptRejectLeafname('/');
+
+    /** Classpath element resource path accept/reject criteria. */
+    public final AcceptRejectWholeString classpathElementResourcePathAcceptReject = //
+            new AcceptRejectWholeString('/');
+
+    /** Module accept/reject criteria (with separator '.'). */
+    public final AcceptRejectWholeString moduleAcceptReject = new AcceptRejectWholeString('.');
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /** If true, scan jarfiles. */
+    public boolean scanJars = true;
+
+    /** If true, scan directories. */
+    public boolean scanDirs = true;
+
+    /** If true, scan the JRE's own {@code lib} and {@code ext} jars when they are found on the classpath. */
+    public boolean enableSystemJars;
+
+    /** If true, scan classfile bytecodes, producing {@code ClassInfo} objects. */
+    public boolean enableClassInfo;
+
+    /**
+     * If true, enables the saving of field info during the scan. This information can be obtained using
+     * {@code ClassInfo#getFieldInfo()}. By default, field info is not scanned, for efficiency.
+     */
+    public boolean enableFieldInfo;
+
+    /**
+     * If true, enables the saving of method info during the scan. This information can be obtained using
+     * {@code ClassInfo#getMethodInfo()}. By default, method info is not scanned, for efficiency.
+     */
+    public boolean enableMethodInfo;
+
+    /**
+     * If true, enables the saving of annotation info (for class, field, method or method parameter annotations)
+     * during the scan. This information can be obtained using {@code ClassInfo#getAllAnnotationInfo()} etc. By
+     * default, annotation info is not scanned, for efficiency.
+     */
+    public boolean enableAnnotationInfo;
+
+    /**
+     * Enable the storing of constant initializer values for static final fields in ClassInfo objects.
+     */
+    public boolean enableStaticFinalFieldConstantInitializerValues;
+
+    /** If true, enables the determination of inter-class dependencies. */
+    public boolean enableInterClassDependencies;
+
+    /**
+     * If true, allow external classes (classes outside of accepted packages) to be returned in the ScanResult, if
+     * they are directly referred to by an accepted class, as a superclass, implemented interface or annotation.
+     * Disabled by default.
+     */
+    public boolean enableExternalClasses;
+
+    /**
+     * If true, ignore class visibility. If false, classes must be public to be scanned.
+     */
+    public boolean ignoreClassVisibility;
+
+    /**
+     * If true, ignore field visibility. If false, fields must be public to be scanned.
+     */
+    public boolean ignoreFieldVisibility;
+
+    /**
+     * If true, ignore method visibility. If false, methods must be public to be scanned.
+     */
+    public boolean ignoreMethodVisibility;
+
+    /**
+     * If true, don't scan runtime-invisible annotations (only scan annotations with RetentionPolicy.RUNTIME).
+     */
+    public boolean disableRuntimeInvisibleAnnotations;
+
+    /**
+     * If true, when classes have superclasses, implemented interfaces or annotations that are external classes,
+     * those classes are also scanned. (Even though this slows down scanning a bit, there is no API for disabling
+     * this currently, since disabling it can lead to problems.)
+     */
+    // #261
+    public boolean extendScanningUpwardsToExternalClasses = true;
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * The maximum length of time to wait for a worker thread to finish. A timeout that is zero, negative, or too
+     * long to express in nanoseconds means "wait indefinitely", which was the behavior before this timeout was
+     * added.
+     */
+    public Duration workerTimeout = ClassGraph.DEFAULT_WORKER_TIMEOUT;
+
+    /**
+     * Get {@link #workerTimeout} in nanoseconds, for {@link Future#get(long, TimeUnit)}.
+     *
+     * @return the number of nanoseconds to wait for a worker thread to finish, or {@link Long#MAX_VALUE} if
+     *         {@link #workerTimeout} is zero, negative, or too long to express in nanoseconds, meaning that worker
+     *         threads should be waited for indefinitely.
+     */
+    public long getWorkerTimeoutNanos() {
+        try {
+            final var timeoutNanos = workerTimeout.toNanos();
+            return timeoutNanos > 0L ? timeoutNanos : Long.MAX_VALUE;
+        } catch (final ArithmeticException e) {
+            // The timeout is longer than Long.MAX_VALUE nanoseconds (about 292 years)
+            return Long.MAX_VALUE;
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /** Constructor. */
+    public ScanSpec() {
+        // Intentionally empty
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Throw {@link IllegalStateException} if {@link #enableClassInfo} was not set before the scan.
+     *
+     * @throws IllegalStateException
+     *             if {@code ClassGraph#enableClassInfo()} was not called before the scan.
+     */
+    public void checkClassInfoEnabled() {
+        checkEnabled(enableClassInfo, "enableClassInfo");
+    }
+
+    /**
+     * Throw {@link IllegalStateException} if {@link #enableMethodInfo} was not set before the scan.
+     *
+     * @throws IllegalStateException
+     *             if {@code ClassGraph#enableMethodInfo()} was not called before the scan.
+     */
+    public void checkMethodInfoEnabled() {
+        checkEnabled(enableMethodInfo, "enableMethodInfo");
+    }
+
+    /**
+     * Throw {@link IllegalStateException} if {@link #enableFieldInfo} was not set before the scan.
+     *
+     * @throws IllegalStateException
+     *             if {@code ClassGraph#enableFieldInfo()} was not called before the scan.
+     */
+    public void checkFieldInfoEnabled() {
+        checkEnabled(enableFieldInfo, "enableFieldInfo");
+    }
+
+    /**
+     * Throw {@link IllegalStateException} if {@link #enableAnnotationInfo} was not set before the scan.
+     *
+     * @throws IllegalStateException
+     *             if {@code ClassGraph#enableAnnotationInfo()} was not called before the scan.
+     */
+    public void checkAnnotationInfoEnabled() {
+        checkEnabled(enableAnnotationInfo, "enableAnnotationInfo");
+    }
+
+    /**
+     * Throw {@link IllegalStateException} if {@link #enableInterClassDependencies} was not set before the scan.
+     *
+     * @throws IllegalStateException
+     *             if {@code ClassGraph#enableInterClassDependencies()} was not called before the scan.
+     */
+    public void checkInterClassDependenciesEnabled() {
+        checkEnabled(enableInterClassDependencies, "enableInterClassDependencies");
+    }
+
+    /**
+     * Throw {@link IllegalStateException} if {@link #enableStaticFinalFieldConstantInitializerValues} was not set
+     * before the scan.
+     *
+     * @throws IllegalStateException
+     *             if {@code ClassGraph#enableStaticFinalFieldConstantInitializerValues()} was not called before the
+     *             scan.
+     */
+    public void checkStaticFinalFieldConstantInitializerValuesEnabled() {
+        checkEnabled(enableStaticFinalFieldConstantInitializerValues,
+                "enableStaticFinalFieldConstantInitializerValues");
+    }
+
+    /**
+     * Throw {@link IllegalStateException} naming the {@code ClassGraph} method that has to be called before the
+     * scan, if the scan option it sets was not enabled.
+     *
+     * @param enabled
+     *            whether the scan option was enabled.
+     * @param enablerMethodName
+     *            the name of the {@code ClassGraph} method that enables the scan option.
+     * @throws IllegalStateException
+     *             if the scan option was not enabled.
+     */
+    private static void checkEnabled(final boolean enabled, final String enablerMethodName) {
+        if (!enabled) {
+            throw new IllegalStateException("Please call ClassGraph#" + enablerMethodName + "() before #scan()");
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Whether a path is a descendant of a rejected path, or an ancestor or descendant of an accepted path.
+     */
+    public enum ScanSpecPathMatch {
+        /** Path starts with (or is) a rejected path prefix. */
+        HAS_REJECTED_PATH_PREFIX,
+        /** Path starts with an accepted path prefix. */
+        HAS_ACCEPTED_PATH_PREFIX,
+        /** Path is accepted. */
+        AT_ACCEPTED_PATH,
+        /** Path is an ancestor of an accepted path. */
+        ANCESTOR_OF_ACCEPTED_PATH,
+        /** Path is the package of a specifically-accepted class. */
+        AT_ACCEPTED_CLASS_PACKAGE,
+        /** Path is not accepted and not rejected. */
+        NOT_WITHIN_ACCEPTED_PATH
+    }
+
+    /**
+     * Returns true if the given directory path is a descendant of a rejected path, or an ancestor or descendant of
+     * an accepted path. The path should end in "/".
+     *
+     * @param relativePath
+     *            the relative path
+     * @return the {@link ScanSpecPathMatch}
+     */
+    public ScanSpecPathMatch dirAcceptMatchStatus(final String relativePath) {
+        // In rejected path
+        if (pathAcceptReject.isRejected(relativePath) || pathPrefixAcceptReject.isRejected(relativePath)) {
+            // A prefix of this path is rejected.
+            return ScanSpecPathMatch.HAS_REJECTED_PATH_PREFIX;
+        }
+
+        if (pathAcceptReject.acceptIsEmpty() && classPackagePathAcceptReject.acceptIsEmpty()) {
+            // If there are no accepted packages, the root package is accepted
+            return relativePath.isEmpty() || "/".equals(relativePath) ? ScanSpecPathMatch.AT_ACCEPTED_PATH
+                    : ScanSpecPathMatch.HAS_ACCEPTED_PATH_PREFIX;
+        }
+
+        // At accepted path
+        if (pathAcceptReject.isSpecificallyAcceptedAndNotRejected(relativePath)) {
+            // Reached an accepted path
+            return ScanSpecPathMatch.AT_ACCEPTED_PATH;
+        }
+        if (classPackagePathAcceptReject.isSpecificallyAcceptedAndNotRejected(relativePath)) {
+            // Reached a package containing a specifically-accepted class
+            return ScanSpecPathMatch.AT_ACCEPTED_CLASS_PACKAGE;
+        }
+
+        // Descendant of accepted path
+        if (pathPrefixAcceptReject.isSpecificallyAccepted(relativePath)) {
+            // Path prefix matches one in the accept
+            return ScanSpecPathMatch.HAS_ACCEPTED_PATH_PREFIX;
+        }
+
+        // Ancestor of accepted path
+        if (
+        // The default package is always the ancestor of accepted paths (need to keep recursing)
+        "/".equals(relativePath)
+                // relativePath is an ancestor (prefix) of an accepted path
+                || pathAcceptReject.acceptHasPrefix(relativePath)
+                // relativePath is an ancestor (prefix) of an accepted class' parent directory
+                || classfilePathAcceptReject.acceptHasPrefix(relativePath)) {
+            return ScanSpecPathMatch.ANCESTOR_OF_ACCEPTED_PATH;
+        }
+
+        // Not in accepted path
+        return ScanSpecPathMatch.NOT_WITHIN_ACCEPTED_PATH;
+    }
+
+    /**
+     * Returns true if the resource at the given path is rejected, either because a rejected package contains it, or
+     * because the classfile itself is rejected.
+     *
+     * <p>
+     * This is for callers that look a resource up by name, rather than reaching it through a walk of a classpath
+     * element, so they do not have the {@link ScanSpecPathMatch} of the containing directory in hand.
+     *
+     * @param relativePath
+     *            the path of the resource, relative to the package root of its classpath element.
+     * @return true if the resource is rejected.
+     */
+    public boolean resourcePathIsRejected(final String relativePath) {
+        // A directory is named with a trailing '/', and the package root is named "/"
+        final var lastSlashIdx = relativePath.lastIndexOf('/');
+        final var parentDirPath = lastSlashIdx < 0 ? "/" : relativePath.substring(0, lastSlashIdx + 1);
+        return dirAcceptMatchStatus(parentDirPath) == ScanSpecPathMatch.HAS_REJECTED_PATH_PREFIX
+                || ClassNames.isClassfilePath(relativePath) && classfilePathAcceptReject
+                        .isRejected(ClassNames.withLowerCaseClassfileExtension(relativePath));
+    }
+
+    /**
+     * Returns true if the given relative path (for a classfile name, including ".class") matches a
+     * specifically-accepted (and non-rejected) classfile's relative path.
+     *
+     * @param relativePath
+     *            the relative path
+     * @return true if the given relative path (for a classfile name, including ".class") matches a
+     *         specifically-accepted (and non-rejected) classfile's relative path.
+     */
+    public boolean classfileIsSpecificallyAccepted(final String relativePath) {
+        return classfilePathAcceptReject.isSpecificallyAcceptedAndNotRejected(relativePath);
+    }
+
+    /**
+     * Returns true if the class is specifically rejected, or is within a rejected package.
+     *
+     * @param className
+     *            the class name
+     * @return true if the class is specifically rejected, or is within a rejected package.
+     */
+    public boolean classOrPackageIsRejected(final String className) {
+        return classAcceptReject.isRejected(className) || packagePrefixAcceptReject.isRejected(className);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Write to log.
+     *
+     * @param log
+     *            The {@link LogNode} to log to.
+     */
+    public void log(final @Nullable LogNode log) {
+        if (log != null) {
+            final var scanSpecLog = log.log("ScanSpec:");
+            for (final Field field : ScanSpec.class.getDeclaredFields()) {
+                if (field.getType() == ClasspathSpec.class) {
+                    // ClasspathSpec logs its own fields, below
+                    continue;
+                }
+                try {
+                    final var value = field.get(this);
+                    // Skip a criterion that nothing was accepted or rejected with
+                    if (value instanceof AcceptReject && value.toString().isEmpty()) {
+                        continue;
+                    }
+                    scanSpecLog.log(field.getName() + ": " + value);
+                } catch (final ReflectiveOperationException e) {
+                    // A criterion that cannot be read is named in the log rather than dropped from it: a log
+                    // that silently omits a criterion reads as if the criterion was never set
+                    scanSpecLog.log(field.getName() + ": could not be read: " + e);
+                }
+            }
+            classpathSpec.log(log);
+        }
+    }
+}

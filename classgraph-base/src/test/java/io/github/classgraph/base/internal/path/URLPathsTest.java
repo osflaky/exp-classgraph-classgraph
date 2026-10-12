@@ -1,0 +1,318 @@
+package io.github.classgraph.base.internal.path;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * Tests for {@link URLPaths}.
+ *
+ * <p>
+ * Apart from the tests that need a real file on disk, all the paths used here are free of Windows drive letters, so
+ * the expected results are the same on every platform.
+ */
+public class URLPathsTest {
+    /** A bare absolute path is turned into a "file://" URL. */
+    @Test
+    public void bareAbsolutePathIsPrefixed() {
+        assertThat(URLPaths.normalizeURLPath("/tmp/x.jar")).isEqualTo("file:///tmp/x.jar");
+    }
+
+    /**
+     * A path that already carries a "file:" prefix must have all five characters of that prefix stripped before the
+     * canonical prefix is added back. Stripping only four left the ':' behind, which was then percent-encoded,
+     * producing "file:%3a/tmp/x.jar".
+     */
+    @Test
+    public void fileSchemePrefixIsStrippedInFull() {
+        assertThat(URLPaths.normalizeURLPath("file:/tmp/x.jar")).isEqualTo("file:///tmp/x.jar");
+    }
+
+    /**
+     * "file://" and "file:///" carry an empty authority, which must not accumulate extra slashes.
+     */
+    @Test
+    public void emptyAuthorityDoesNotAccumulateSlashes() {
+        assertThat(URLPaths.normalizeURLPath("file://tmp/x.jar")).isEqualTo("file:///tmp/x.jar");
+        assertThat(URLPaths.normalizeURLPath("file:///tmp/x.jar")).isEqualTo("file:///tmp/x.jar");
+    }
+
+    /**
+     * The {@code "//"} that starts a UNC path is part of the path, not the empty authority in front of it, so it
+     * has to survive. Collapsing every leading slash down to one turned {@code "file:////server/share/x"} into
+     * {@code "file:///server/share/x"}, which names a local path rather than the share it came from.
+     */
+    @Test
+    public void aUNCPathKeepsTheSlashesThatStartIt() {
+        assertThat(URLPaths.normalizeURLPath("file:////server/share/x.jar"))
+                .isEqualTo("file:////server/share/x.jar");
+        // The same path with no "file:" prefix already reaches this spelling, and still does
+        assertThat(URLPaths.normalizeURLPath("//server/share/x.jar")).isEqualTo("file:////server/share/x.jar");
+    }
+
+    /** A "jar:file:" prefix is stripped by both branches in turn. */
+    @Test
+    public void jarAndFileSchemePrefixesAreBothStripped() {
+        assertThat(URLPaths.normalizeURLPath("jar:file:/tmp/x.jar")).isEqualTo("file:///tmp/x.jar");
+        assertThat(URLPaths.normalizeURLPath("jar:/tmp/x.jar")).isEqualTo("file:///tmp/x.jar");
+    }
+
+    /**
+     * A path containing a nested jar separator gets the "jar:" prefix added back. The jar has to exist on disk,
+     * since a '!' only counts as a separator if the path before it names a file.
+     */
+    // #903
+    @Test
+    public void nestedJarPathsGetJarPrefix(@TempDir final Path tempDir) throws IOException {
+        final var jarPath = slashes(Files.createFile(tempDir.resolve("x.jar")));
+        final var jarUrl = URLPaths.normalizeURLPath(jarPath);
+        assertThat(jarUrl).startsWith("file:///").endsWith("/x.jar");
+        assertThat(URLPaths.normalizeURLPath(jarPath + "!/BOOT-INF/classes"))
+                .isEqualTo("jar:" + jarUrl + "!/BOOT-INF/classes");
+        assertThat(URLPaths.normalizeURLPath("file:" + jarPath + "!/BOOT-INF/classes"))
+                .isEqualTo("jar:" + jarUrl + "!/BOOT-INF/classes");
+    }
+
+    /**
+     * A '!' that is part of a directory or file name is an ordinary character, not a nested jar separator, so no
+     * '/' may be inserted after it -- doing so names a different path, which cannot be opened.
+     */
+    // #903
+    @Test
+    public void bangInADirectoryNameIsNotASeparator(@TempDir final Path tempDir) throws IOException {
+        final var dir = Files.createDirectories(tempDir.resolve("with!bang"));
+        final var jarPath = slashes(Files.createFile(dir.resolve("x.jar")));
+        // The directory itself is not a jarfile, so nothing is nested and no "jar:" prefix is added
+        assertThat(URLPaths.normalizeURLPath(jarPath)).startsWith("file:///").endsWith("/with!bang/x.jar");
+        // Only the '!' that separates the jar from the path within it is a separator
+        assertThat(URLPaths.normalizeURLPath(jarPath + "!/probepkg/Probe.class")).startsWith("jar:file:///")
+                .endsWith("/with!bang/x.jar!/probepkg/Probe.class");
+    }
+
+    /**
+     * A '!' within a jarfile's entry names is not a separator either, so no '/' may be inserted after it.
+     */
+    // #903
+    @Test
+    public void bangInAJarEntryNameIsNotASeparator(@TempDir final Path tempDir) throws IOException {
+        final var jarPath = slashes(Files.createFile(tempDir.resolve("x.jar")));
+        final var jarUrl = URLPaths.normalizeURLPath(jarPath);
+        // "dir!name/x.txt" is one entry name within x.jar, so rewriting it to "dir!/name/x.txt" would name an
+        // entry that does not exist
+        assertThat(URLPaths.normalizeURLPath(jarPath + "!/dir!name/x.txt"))
+                .isEqualTo("jar:" + jarUrl + "!/dir!name/x.txt");
+        // A trailing separator names the whole of the jarfile, and needs the '/' that the scheme requires
+        assertThat(URLPaths.normalizeURLPath(jarPath + "!")).isEqualTo("jar:" + jarUrl + "!/");
+    }
+
+    /**
+     * The path of a file, with the platform's separator turned into the '/' that URLs use.
+     *
+     * @param path
+     *            the path
+     * @return the path as a string, using '/' as the separator
+     */
+    private static String slashes(final Path path) {
+        return path.toString().replace(File.separatorChar, '/');
+    }
+
+    /** Schemes that are passed through untouched. */
+    @Test
+    public void nonFileSchemesArePassedThrough() {
+        assertThat(URLPaths.normalizeURLPath("jrt:/java.base")).isEqualTo("jrt:/java.base");
+        assertThat(URLPaths.normalizeURLPath("http://example.com/x.jar")).isEqualTo("http://example.com/x.jar");
+        assertThat(URLPaths.normalizeURLPath("https://example.com/x.jar")).isEqualTo("https://example.com/x.jar");
+    }
+
+    /**
+     * A URL keeps the percent encoding it was written with, since a path that is still a URL is never decoded, so
+     * encoding it a second time would name a resource that does not exist. Only a lone {@code '%'} that does not
+     * introduce an escape is encoded.
+     */
+    @Test
+    public void aUrlIsNotEncodedASecondTime() {
+        assertThat(URLPaths.normalizeURLPath("http://example.com/a%20b.jar"))
+                .isEqualTo("http://example.com/a%20b.jar");
+        assertThat(URLPaths.normalizeURLPath("https://example.com/a%2Fb.jar"))
+                .isEqualTo("https://example.com/a%2Fb.jar");
+        assertThat(URLPaths.normalizeURLPath("http://example.com/100%.jar"))
+                .isEqualTo("http://example.com/100%25.jar");
+    }
+
+    /**
+     * The syntax of a URL is left intact: the colon before a port number, and the delimiters of a query string, are
+     * part of the URL rather than characters of a name. Encoding the colon would put the port number into the host
+     * name, which names a server that does not exist.
+     */
+    @Test
+    public void theSyntaxOfAUrlIsNotEncoded() throws Exception {
+        final var url = URLPaths.normalizeURLPath("http://example.com:8080/dir/x.jar?v=1&t=2");
+        assertThat(url).isEqualTo("http://example.com:8080/dir/x.jar?v=1&t=2");
+        assertThat(new URI(url).getHost()).isEqualTo("example.com");
+        assertThat(new URI(url).getPort()).isEqualTo(8080);
+    }
+
+    /**
+     * A URL that was written with a character a URI cannot hold is still encoded, so that the result parses. Only
+     * what has to be escaped is escaped.
+     */
+    @Test
+    public void aCharacterAUriCannotHoldIsEncodedInAUrl() throws Exception {
+        assertThat(URLPaths.normalizeURLPath("http://example.com/a b.jar"))
+                .isEqualTo("http://example.com/a%20b.jar");
+        assertThat(URLPaths.normalizeURLPath("http://example.com/é.jar"))
+                .isEqualTo("http://example.com/%c3%a9.jar");
+        assertThat(new URI(URLPaths.normalizeURLPath("http://example.com/a b.jar")).getPath())
+                .isEqualTo("/a b.jar");
+    }
+
+    /**
+     * A {@code "!/"} separates a jarfile from a path within it whatever the jarfile is fetched over, so a jarfile
+     * nested inside one that was fetched over http is named by a {@code "jar:"} URL, exactly as a nested jarfile on
+     * the local filesystem is.
+     */
+    @Test
+    public void aJarNestedInsideAJarFetchedOverHttpIsAJarUrl() {
+        assertThat(URLPaths.normalizeURLPath("http://example.com/outer.jar!/lib/inner.jar"))
+                .isEqualTo("jar:http://example.com/outer.jar!/lib/inner.jar");
+        // There is no filesystem to ask which '!' of a remote URL separates, so the first one does, and it is
+        // written in the "!/" spelling the "jar:" scheme requires -- the rule
+        // PathSyntax#indexOfNestedJarSeparator states for a path that could not be stat-ed. The URL names the same
+        // thing Vfs#open would open for the same string, which is what matters
+        assertThat(URLPaths.normalizeURLPath("http://example.com/with!bang/x.jar"))
+                .isEqualTo("jar:http://example.com/with!/bang/x.jar");
+    }
+
+    /**
+     * The whole point of normalizing is to produce something the {@link URI} constructor accepts, so check that the
+     * result parses and keeps the path intact. {@code ClasspathElementZip#getURI()} throws if this fails.
+     */
+    @Test
+    public void normalizedPathsParseAsURIs() throws Exception {
+        assertThat(new URI(URLPaths.normalizeURLPath("file:/tmp/x.jar")).getPath()).isEqualTo("/tmp/x.jar");
+        assertThat(new URI(URLPaths.normalizeURLPath("/tmp/x.jar")).getPath()).isEqualTo("/tmp/x.jar");
+        // A relative path stays relative, so it is opaque rather than hierarchical
+        assertThat(new URI(URLPaths.normalizeURLPath("tmp/x.jar")).toString()).isEqualTo("file:tmp/x.jar");
+    }
+
+    /** Characters that are not URL-safe are percent-encoded, and '/' is left alone. */
+    @Test
+    public void unsafeCharactersAreEncoded() {
+        assertThat(URLPaths.encodePath("/tmp/a b.jar")).isEqualTo("/tmp/a%20b.jar");
+        assertThat(URLPaths.encodePath("/tmp/a[1].jar")).isEqualTo("/tmp/a%5b1%5d.jar");
+        // Non-ASCII characters are encoded as their UTF-8 bytes
+        assertThat(URLPaths.encodePath("/tmp/é.jar")).isEqualTo("/tmp/%c3%a9.jar");
+    }
+
+    /** The "safe" and "extra" URL character rules, plus '/', are left as they are. */
+    @Test
+    public void safeCharactersAreNotEncoded() {
+        final var safeChars = "abcXYZ019$-_.+!*'(),/";
+        assertThat(URLPaths.encodePath(safeChars)).isEqualTo(safeChars);
+    }
+
+    /** A ':' is only left alone where it belongs to a URL scheme prefix. */
+    @Test
+    public void colonIsOnlyKeptInASchemePrefix() {
+        assertThat(URLPaths.encodePath("file:/tmp/x.jar")).isEqualTo("file:/tmp/x.jar");
+        assertThat(URLPaths.encodePath("jar:file:/tmp/x.jar")).isEqualTo("jar:file:/tmp/x.jar");
+        assertThat(URLPaths.encodePath("jrt:/java.base")).isEqualTo("jrt:/java.base");
+        // A ':' anywhere else is encoded, since it is not safe in a path segment
+        assertThat(URLPaths.encodePath("/tmp/a:b.jar")).isEqualTo("/tmp/a%3ab.jar");
+    }
+
+    /** Encoding and then decoding a path returns the original path. */
+    @Test
+    public void encodingThenDecodingRoundTrips() {
+        final var path = "/tmp/a b[1]+é.jar";
+        assertThat(FastPathResolver.decodePercentEncoding(URLPaths.encodePath(path))).isEqualTo(path);
+    }
+
+    /**
+     * A character outside the Basic Multilingual Plane survives being encoded and decoded again. Such a character
+     * is stored as a surrogate pair, and the two surrogates only encode as UTF-8 together, so encoding each of them
+     * on its own turns the character into "??", renaming the path.
+     */
+    @Test
+    public void charactersOutsideTheBasicMultilingualPlaneRoundTrip() {
+        // U+1D54F MATHEMATICAL DOUBLE-STRUCK CAPITAL X, and U+1F600 GRINNING FACE
+        final var path = "/tmp/𝕏😀.jar";
+        assertThat(FastPathResolver.decodePercentEncoding(URLPaths.encodePath(path))).isEqualTo(path);
+    }
+
+    /**
+     * The server of a UNC path has to be in the path of a {@code "file:"} URI, not in its authority, otherwise
+     * {@link java.net.URL} reads the URI back as a local path with the server dropped. Verified on Windows: opening
+     * {@code file://server/share/x} fails with {@code FileNotFoundException: \share\x}, while
+     * {@code file:////server/share/x} reads the file the UNC path names.
+     */
+    @Test
+    public void aUNCServerIsMovedFromTheAuthorityIntoThePath() {
+        assertThat(URLPaths.moveUNCServerIntoPath(URI.create("file://server/share/x")))
+                .isEqualTo(URI.create("file:////server/share/x"));
+        // A directory URI keeps its trailing slash
+        assertThat(URLPaths.moveUNCServerIntoPath(URI.create("file://server/share/dir/")))
+                .isEqualTo(URI.create("file:////server/share/dir/"));
+        // Percent escapes in the path are carried over as they are, rather than being decoded or double-encoded
+        assertThat(URLPaths.moveUNCServerIntoPath(URI.create("file://server/share/a%20b")))
+                .isEqualTo(URI.create("file:////server/share/a%20b"));
+    }
+
+    /** A URI that has no authority to move is returned unchanged, whatever its scheme. */
+    @Test
+    public void aURIWithNoAuthorityIsUnchanged() {
+        for (final var uri : new String[] { "file:///tmp/x.jar", "file:/tmp/x.jar", "file:////server/share/x",
+                "jar:file:///tmp/x.jar!/a/b", "jrt:/java.base/java/lang/Object.class" }) {
+            assertThat(URLPaths.moveUNCServerIntoPath(URI.create(uri))).isEqualTo(URI.create(uri));
+        }
+        // Only a "file:" URI names a path on the local filesystem, so an authority is left alone for any other
+        // scheme -- there it is a real host, not a UNC server
+        assertThat(URLPaths.moveUNCServerIntoPath(URI.create("https://host/a/b")))
+                .isEqualTo(URI.create("https://host/a/b"));
+    }
+
+    /**
+     * A comma is not a legal character in a URL scheme, so a path containing one before the first ':' is not a URL.
+     * (The character class in the scheme pattern used to read "+-.", which is a range covering ',' rather than the
+     * three literal characters.)
+     */
+    @Test
+    public void commaIsNotPartOfAURLScheme() {
+        assertThat(URLPaths.startsWithURLScheme("a,b:/x")).isFalse();
+    }
+
+    /** The characters that really are legal in a URL scheme are still accepted. */
+    @Test
+    public void legalSchemeCharactersStillMatch() {
+        assertThat(URLPaths.startsWithURLScheme("http://x")).isTrue();
+        assertThat(URLPaths.startsWithURLScheme("a+b:/x")).isTrue();
+        assertThat(URLPaths.startsWithURLScheme("a-b:/x")).isTrue();
+        assertThat(URLPaths.startsWithURLScheme("a.b:/x")).isTrue();
+        assertThat(URLPaths.startsWithURLScheme("a9:/x")).isTrue();
+    }
+
+    /**
+     * Only the start of the path decides whether it has a scheme. (The pattern used to have to match the whole
+     * path, and its {@code ".*"} did not match a line terminator, so a path holding one was not a URL.)
+     */
+    @Test
+    public void aSchemeIsRecognizedWhateverFollowsIt() {
+        assertThat(URLPaths.startsWithURLScheme("http://x\ny")).isTrue();
+        assertThat(URLPaths.startsWithURLScheme("http:")).isTrue();
+    }
+
+    /**
+     * A single-character scheme is not treated as a scheme, so that Windows drive letters are not mistaken for one.
+     */
+    @Test
+    public void singleCharSchemeDoesNotMatch() {
+        assertThat(URLPaths.startsWithURLScheme("C:/x")).isFalse();
+    }
+}

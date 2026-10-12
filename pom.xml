@@ -1,0 +1,956 @@
+<!-- child.project.url.inherit.append.path="false": without it, Maven appends each module's -->
+<!-- artifactId to the inherited <url>, producing URLs that do not exist. Unlike the equivalent -->
+<!-- attributes for <scm> (below), which go on the <scm> element itself, this one is only read -->
+<!-- from the <project> element. Maven silently ignores it if it is put on <url>. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd" child.project.url.inherit.append.path="false">
+	<modelVersion>4.0.0</modelVersion>
+
+	<groupId>io.github.classgraph</groupId>
+	<artifactId>classgraph-parent</artifactId>
+	<version>5.0.0-SNAPSHOT</version>
+	<packaging>pom</packaging>
+	<name>ClassGraph (parent)</name>
+
+	<description>Build configuration shared by all ClassGraph modules.</description>
+
+	<url>https://github.com/classgraph/classgraph</url>
+
+	<modules>
+		<module>classgraph-base</module>
+		<module>classgraph-vfs</module>
+		<module>classgraph-classpath</module>
+		<module>classgraph</module>
+		<module>classgraph-viz</module>
+	</modules>
+
+	<licenses>
+		<license>
+			<name>The MIT License (MIT)</name>
+			<url>http://opensource.org/licenses/MIT</url>
+			<distribution>repo</distribution>
+		</license>
+	</licenses>
+
+	<developers>
+		<developer>
+			<name>Luke Hutchison</name>
+			<email>luke.hutch@gmail.com</email>
+			<organization>ClassGraph</organization>
+			<organizationUrl>https://github.com/classgraph</organizationUrl>
+		</developer>
+	</developers>
+
+	<scm child.scm.connection.inherit.append.path="false" child.scm.developerConnection.inherit.append.path="false" child.scm.url.inherit.append.path="false">
+		<!-- Use https rather than git@github.com: maven-release-plugin pushes using -->
+		<!-- <developerConnection>, and the origin remote and the gh credential helper -->
+		<!-- both authenticate over https. -->
+		<connection>scm:git:https://github.com/classgraph/classgraph.git</connection>
+		<developerConnection>scm:git:https://github.com/classgraph/classgraph.git</developerConnection>
+		<url>https://github.com/classgraph/classgraph</url>
+		<tag>HEAD</tag>
+	</scm>
+
+	<issueManagement>
+		<url>https://github.com/classgraph/classgraph/issues</url>
+	</issueManagement>
+
+	<properties>
+		<!-- Set UTF-8 encoding for Maven plugins and output -->
+		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+		<project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+		<!-- The minimum Java version that ClassGraph supports. Keep this as "release", and never replace -->
+		<!-- it with "source" and "target": "release" compiles against the JDK 17 API, so calling a method -->
+		<!-- that a JDK 17 runtime does not have is a compile error, whereas "source" and "target" compile -->
+		<!-- against the API of whichever JDK is running the build, and such a call then builds cleanly and -->
+		<!-- throws NoSuchMethodError on JDK 17 alone. That is what broke ClassGraph in #284: JDK 9 changed -->
+		<!-- ByteBuffer.position(int) and its neighbours to return ByteBuffer rather than Buffer, and a -->
+		<!-- build with "source"/"target" 7 emitted calls to methods that JDK 7 and 8 did not have. The -->
+		<!-- requireProperty rule below fails the build if this property is removed. -->
+		<maven.compiler.release>17</maven.compiler.release>
+
+		<!-- Suppress the warning logged when Narcissus loads its native library -->
+		<surefireArgLine>--enable-native-access=ALL-UNNAMED</surefireArgLine>
+
+		<!-- The repository root, which holds the files that all modules share (the code formatter -->
+		<!-- profile and the license). Every module is exactly one directory below it, and overrides -->
+		<!-- this with ${project.basedir}/.. accordingly. -->
+		<rootDir>${project.basedir}</rootDir>
+
+		<!-- The javac lint categories that are switched off. "exports" fires for every JSpecify -->
+		<!-- @Nullable in an exported signature, and can only be silenced by "requires transitive -->
+		<!-- org.jspecify". That would force every modular downstream project to put JSpecify on its -->
+		<!-- own module path, which is what broke Log4j 2.24.0 for its users; JSpecify is therefore a -->
+		<!-- plain "requires static", and the annotations are simply invisible to a downstream module -->
+		<!-- that does not depend on JSpecify itself. A module may switch off further categories. -->
+		<javacLintSuppressions>-Xlint:-exports</javacLintSuppressions>
+
+		<!-- The OSGi manifest entries that differ between modules. Set by each module; they must -->
+		<!-- agree with the module's src/main/java/module-info.java. -->
+		<osgiBundleName />
+		<osgiExportPackage />
+		<osgiImportPackage />
+		<osgiDependencies />
+
+		<!-- The aggregator pom has no sources and produces no artifact, so the two steps below have -->
+		<!-- nothing to do for it: the ecj checks would have nothing to compile, and the license -->
+		<!-- copies would just leave a stray target directory at the repository root. Both are -->
+		<!-- skipped by default, and each module re-enables them. -->
+		<maven.antrun.skip>true</maven.antrun.skip>
+		<maven.resources.skip>true</maven.resources.skip>
+	</properties>
+
+	<!-- Every version used by any module is pinned here, so that there is one place to bump it, and so that -->
+	<!-- two modules can never end up on different versions of the same library. -->
+	<!-- Find dependency updates with: ./mvnw versions:display-dependency-updates -->
+	<dependencyManagement>
+		<dependencies>
+			<!-- Optional runtime dependency: -->
+			<dependency>
+				<groupId>io.github.toolfactory</groupId>
+				<artifactId>narcissus</artifactId>
+				<version>1.0.13</version>
+				<optional>true</optional>
+			</dependency>
+
+			<!-- Test dependencies: -->
+			<dependency>
+				<groupId>org.junit.jupiter</groupId>
+				<artifactId>junit-jupiter</artifactId>
+				<version>6.1.3</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.openjdk.jmh</groupId>
+				<artifactId>jmh-core</artifactId>
+				<version>1.37</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.openjdk.jmh</groupId>
+				<artifactId>jmh-generator-annprocess</artifactId>
+				<version>1.37</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.assertj</groupId>
+				<artifactId>assertj-core</artifactId>
+				<version>3.27.7</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>javax.enterprise</groupId>
+				<artifactId>cdi-api</artifactId>
+				<version>2.0.SP1</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.ops4j.pax.url</groupId>
+				<artifactId>pax-url-aether</artifactId>
+				<version>3.0.3</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.slf4j</groupId>
+				<artifactId>slf4j-api</artifactId>
+				<version>2.0.18</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.slf4j</groupId>
+				<artifactId>slf4j-jdk14</artifactId>
+				<version>2.0.18</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.hibernate.javax.persistence</groupId>
+				<artifactId>hibernate-jpa-2.1-api</artifactId>
+				<version>1.0.2.Final</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>com.google.jimfs</groupId>
+				<artifactId>jimfs</artifactId>
+				<version>1.3.1</version>
+				<scope>test</scope>
+			</dependency>
+			<dependency>
+				<groupId>jakarta.validation</groupId>
+				<artifactId>jakarta.validation-api</artifactId>
+				<version>3.1.1</version>
+				<scope>test</scope>
+			</dependency>
+
+			<!-- "provided" dependencies (soft compile-time dependencies that do not create a runtime dependency): -->
+			<dependency>
+				<!-- JSpecify nullability annotations. "provided" scope, so that ClassGraph does not add a -->
+				<!-- runtime dependency: the annotations are RUNTIME-retained, but the JVM silently ignores -->
+				<!-- annotations whose type is not on the classpath. -->
+				<groupId>org.jspecify</groupId>
+				<artifactId>jspecify</artifactId>
+				<version>1.0.1</version>
+				<scope>provided</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<!-- What every module needs. Anything used by only one module is declared by that module instead. -->
+	<dependencies>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.assertj</groupId>
+			<artifactId>assertj-core</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.jspecify</groupId>
+			<artifactId>jspecify</artifactId>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<!-- Plugins are listed here, but configured in pluginManagement, for compatibility with Eclipse. -->
+			<!-- See: https://stackoverflow.com/a/10483284/3950982 -->
+			<!-- Find plugin updates with: ./mvnw versions:display-plugin-updates -->
+			<!-- List order of plugin execution with: ./mvnw -Prelease fr.jcgay.maven.plugins:buildplan-maven-plugin:list-phase -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-enforcer-plugin</artifactId>
+				<version>3.6.3</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-resources-plugin</artifactId>
+				<version>3.5.0</version>
+			</plugin>
+			<plugin>
+				<groupId>net.revelc.code.formatter</groupId>
+				<artifactId>formatter-maven-plugin</artifactId>
+				<version>2.29.0</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<version>3.15.0</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<version>3.5.6</version>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>build-helper-maven-plugin</artifactId>
+				<version>3.6.1</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-jar-plugin</artifactId>
+				<version>3.5.1</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-antrun-plugin</artifactId>
+				<version>3.2.0</version>                <!--$NO-MVN-MAN-VER$ -->
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-source-plugin</artifactId>
+				<version>3.4.0</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<version>3.12.0</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-gpg-plugin</artifactId>
+				<version>3.2.8</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-release-plugin</artifactId>
+				<version>3.3.1</version>
+			</plugin>
+
+			<!-- Override versions of the following plugins, inherited from the super-pom, with latest versions -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-clean-plugin</artifactId>
+				<version>3.5.0</version>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-install-plugin</artifactId>
+				<version>3.1.4</version>
+			</plugin>
+		</plugins>
+
+		<pluginManagement>
+			<plugins>
+				<!-- Enforce minimum Maven and JDK versions -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-enforcer-plugin</artifactId>
+					<executions>
+						<execution>
+							<id>enforce-versions</id>
+							<phase>validate</phase>
+							<goals>
+								<goal>enforce</goal>
+							</goals>
+							<configuration>
+								<rules>
+									<requireMavenVersion>
+										<version>[3.6.3,)</version>
+									</requireMavenVersion>
+									<!-- ClassGraph targets JDK 17 via ${maven.compiler.release}, so it can be -->
+									<!-- built by any JDK 17 or later. Animal Sniffer is no longer needed to -->
+									<!-- check the API level: "release" checks it against the JDK 17 API. -->
+									<requireJavaVersion>
+										<version>[17,)</version>
+										<message>ClassGraph must be built with JDK 17 or later.</message>
+									</requireJavaVersion>
+									<!-- Building against the API of the JDK that happens to be running the -->
+									<!-- build, rather than against the API of the oldest JDK that ClassGraph -->
+									<!-- supports, produces code that compiles cleanly and then fails at -->
+									<!-- runtime. See the note on ${maven.compiler.release} for the details, -->
+									<!-- and #284 for the bug that this prevents. -->
+									<requireProperty>
+										<property>maven.compiler.release</property>
+										<regex>\d+</regex>
+										<message>maven.compiler.release must be set to the oldest JDK version
+											that ClassGraph supports, and must not be replaced by
+											maven.compiler.source and maven.compiler.target. See the note on that
+											property in the root pom.xml.</message>
+										<regexMessage>maven.compiler.release must be a JDK version
+											number.</regexMessage>
+									</requireProperty>
+								</rules>
+							</configuration>
+						</execution>
+					</executions>
+				</plugin>
+
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-resources-plugin</artifactId>
+					<executions>
+						<!-- Copy LICENSE-ClassGraph.txt to build root -->
+						<execution>
+							<id>copy-license-to-target</id>
+							<phase>process-resources</phase>
+							<goals>
+								<goal>copy-resources</goal>
+							</goals>
+							<configuration>
+								<outputDirectory>${project.build.outputDirectory}</outputDirectory>
+								<resources>
+									<resource>
+										<directory>${rootDir}</directory>
+										<filtering>false</filtering>
+										<includes>
+											<include>LICENSE-ClassGraph.txt</include>
+										</includes>
+									</resource>
+								</resources>
+							</configuration>
+						</execution>
+						<execution>
+							<id>copy-license-to-javadocs</id>
+							<phase>process-resources</phase>
+							<goals>
+								<goal>copy-resources</goal>
+							</goals>
+							<configuration>
+								<outputDirectory>${project.build.directory}/apidocs</outputDirectory>
+								<resources>
+									<resource>
+										<directory>${rootDir}</directory>
+										<filtering>false</filtering>
+										<includes>
+											<include>LICENSE-ClassGraph.txt</include>
+										</includes>
+									</resource>
+								</resources>
+							</configuration>
+						</execution>
+					</executions>
+				</plugin>
+
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-antrun-plugin</artifactId>
+					<dependencies>
+						<!-- The Eclipse batch compiler, run by the two ecj-check executions below. It is a plugin -->
+						<!-- dependency rather than something found on the machine, so that CI and a developer's -->
+						<!-- workstation gate on exactly the same compiler version. -->
+						<dependency>
+							<groupId>org.eclipse.jdt</groupId>
+							<artifactId>ecj</artifactId>
+							<version>3.46.0</version>
+						</dependency>
+					</dependencies>
+					<executions>
+						<!-- Compile every source file with the Eclipse compiler before javac gets to it, and fail -->
+						<!-- the build on any warning. The two compilers disagree about plenty: each one has -->
+						<!-- diagnostics the other lacks, so a build that only ever runs javac silently accumulates -->
+						<!-- the warnings that show up in an IDE, which compiles with ecj. The severities come from -->
+						<!-- .vscode/org.eclipse.jdt.core.prefs, the same file the IDE reads, so the IDE and the -->
+						<!-- build cannot drift apart. Nothing is written to disk: "-d none" means the run is a -->
+						<!-- check and javac still produces every class file. -->
+						<execution>
+							<id>ecj-check-main</id>
+							<!-- process-resources is the last phase before compile -->
+							<phase>process-resources</phase>
+							<goals>
+								<goal>run</goal>
+							</goals>
+							<configuration>
+								<target>
+									<!-- ecj is given the "io" subdirectory rather than the source root, because it -->
+									<!-- has no way to exclude a source file and it cannot compile module-info.java: -->
+									<!-- Narcissus is a multi-release jar whose module descriptor lives under -->
+									<!-- META-INF/versions/9/, which ecj cannot read (javac can). Every main source -->
+									<!-- other than module-info.java is under "io", and this fails the build if that -->
+									<!-- ever stops being true, rather than quietly leaving the new file unchecked. -->
+									<fileset id="ecjUncheckedMainSources" dir="${project.build.sourceDirectory}"
+										includes="**/*.java" excludes="io/**,module-info.java" />
+									<pathconvert property="ecjUncheckedMainSourceList"
+										refid="ecjUncheckedMainSources" setonempty="false" />
+									<fail if="ecjUncheckedMainSourceList"
+										message="The Eclipse compiler check only covers the &quot;io&quot; subdirectory of the source root, so these sources would go unchecked: ${ecjUncheckedMainSourceList}. Move them under &quot;io&quot;, or extend the ecj-check-main execution in the root pom.xml to cover them." />
+									<!-- On the classpath but not yet created, and ecj grumbles about that -->
+									<mkdir dir="${project.build.outputDirectory}" />
+									<java classname="org.eclipse.jdt.internal.compiler.batch.Main" fork="true"
+										failonerror="true" dir="${project.basedir}">
+										<classpath refid="maven.plugin.classpath" />
+										<arg value="--release" />
+										<arg value="${maven.compiler.release}" />
+										<arg value="-encoding" />
+										<arg value="${project.build.sourceEncoding}" />
+										<!-- Error Prone and NullAway run as annotation processors under javac -->
+										<arg value="-proc:none" />
+										<!-- Check only: write no class files, and leave target/classes to javac -->
+										<arg value="-d" />
+										<arg value="none" />
+										<arg value="-failOnWarning" />
+										<arg value="-properties" />
+										<arg file="${rootDir}/.vscode/org.eclipse.jdt.core.prefs" />
+										<arg value="-classpath" />
+										<arg pathref="maven.compile.classpath" />
+										<arg file="${project.build.sourceDirectory}/io" />
+									</java>
+								</target>
+							</configuration>
+						</execution>
+						<execution>
+							<id>ecj-check-test</id>
+							<!-- process-test-resources is the last phase before test-compile -->
+							<phase>process-test-resources</phase>
+							<goals>
+								<goal>run</goal>
+							</goals>
+							<configuration>
+								<target xmlns:if="ant:if">
+									<!-- Unlike the main sources, the test sources have no module descriptor, so the -->
+									<!-- whole source root can be handed to ecj. Fail if one ever appears, rather -->
+									<!-- than letting ecj report a confusing resolution error. -->
+									<fail message="Test sources now contain a module descriptor, which the ecj-check-test execution in the root pom.xml cannot compile. See the note on ecj-check-main.">
+										<condition>
+											<available
+												file="${project.build.testSourceDirectory}/module-info.java" />
+										</condition>
+									</fail>
+									<!-- build-helper adds src/test/perf as a second test source root, and only some -->
+									<!-- modules have one -->
+									<available property="ecjHasPerfTestSources" file="${project.basedir}/src/test/perf"
+										type="dir" />
+									<!-- On the classpath but not yet created, and ecj grumbles about that -->
+									<mkdir dir="${project.build.testOutputDirectory}" />
+									<java classname="org.eclipse.jdt.internal.compiler.batch.Main" fork="true"
+										failonerror="true" dir="${project.basedir}">
+										<classpath refid="maven.plugin.classpath" />
+										<arg value="--release" />
+										<arg value="${maven.compiler.release}" />
+										<arg value="-encoding" />
+										<arg value="${project.build.sourceEncoding}" />
+										<arg value="-proc:none" />
+										<arg value="-d" />
+										<arg value="none" />
+										<arg value="-failOnWarning" />
+										<arg value="-properties" />
+										<arg file="${rootDir}/.vscode/org.eclipse.jdt.core.prefs" />
+										<arg value="-classpath" />
+										<arg pathref="maven.test.classpath" />
+										<arg file="${project.build.testSourceDirectory}" />
+										<arg file="${project.basedir}/src/test/perf" if:set="ecjHasPerfTestSources" />
+									</java>
+								</target>
+							</configuration>
+						</execution>
+					</executions>
+				</plugin>
+
+				<!-- Reformat sources with the Eclipse code formatter, using the shared project profile. -->
+				<!-- The same profile can be imported into Eclipse via -->
+				<!-- Preferences -> Java -> Code Style -> Formatter -> Import. -->
+				<!-- Run "./mvnw formatter:validate" to check formatting without rewriting the sources. -->
+				<plugin>
+					<groupId>net.revelc.code.formatter</groupId>
+					<artifactId>formatter-maven-plugin</artifactId>
+					<configuration>
+						<configFile>${rootDir}/.eclipse/code-formatter-config.xml</configFile>
+						<encoding>UTF-8</encoding>
+						<lineEnding>LF</lineEnding>
+						<!-- Only the Java sources are formatted. The plugin also formats XML, JSON, HTML, CSS -->
+						<!-- and JavaScript by default, which would rewrite any pom.xml it found in one of the -->
+						<!-- directories below. -->
+						<skipXmlFormatting>true</skipXmlFormatting>
+						<skipJsonFormatting>true</skipJsonFormatting>
+						<skipHtmlFormatting>true</skipHtmlFormatting>
+						<skipCssFormatting>true</skipCssFormatting>
+						<skipJsFormatting>true</skipJsFormatting>
+						<!-- Setting <directories> replaces the default source and test source directories, -->
+						<!-- so both have to be listed again here, along with the extra test source root -->
+						<!-- that build-helper-maven-plugin adds. Directories that do not exist are skipped. -->
+						<!-- The last two only exist in the parent, and hold sources that are built by CI -->
+						<!-- rather than by Maven; the source files under src/test/resources are deliberately -->
+						<!-- not listed, since they are the provenance of committed classfiles. -->
+						<directories>
+							<directory>${project.build.sourceDirectory}</directory>
+							<directory>${project.build.testSourceDirectory}</directory>
+							<directory>${project.basedir}/src/test/perf</directory>
+							<directory>${project.basedir}/benchmark</directory>
+							<directory>${project.basedir}/.github/jpms-consumer</directory>
+						</directories>
+						<!-- The formatter parses the sources itself, so it needs to be told the language level -->
+						<compilerSource>${maven.compiler.release}</compilerSource>
+						<compilerCompliance>${maven.compiler.release}</compilerCompliance>
+						<compilerTargetPlatform>${maven.compiler.release}</compilerTargetPlatform>
+					</configuration>
+					<executions>
+						<execution>
+							<id>format-sources</id>
+							<phase>process-sources</phase>
+							<goals>
+								<goal>format</goal>
+							</goals>
+						</execution>
+					</executions>
+				</plugin>
+
+				<!-- Compile sources -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-compiler-plugin</artifactId>
+					<configuration>
+						<encoding>UTF-8</encoding>
+						<useIncrementalCompilation>false</useIncrementalCompilation>
+						<compilerArgs>
+							<arg>-Xlint:all</arg>             <!-- Max lint -->
+							<arg>${javacLintSuppressions}</arg>
+							<arg>-Werror</arg>
+						</compilerArgs>
+					</configuration>
+					<executions>
+						<execution>
+							<id>default-testCompile</id>
+							<phase>test-compile</phase>
+							<goals>
+								<goal>testCompile</goal>
+							</goals>
+							<configuration>
+								<encoding>UTF-8</encoding>
+								<!-- Compile and run the tests on the classpath rather than the module path: -->
+								<!-- they are white-box tests, so they read the internal packages, which -->
+								<!-- the module descriptor does not export, and they use classes (e.g. java.awt) -->
+								<!-- that only the test code needs. -->
+								<useModulePath>false</useModulePath>
+								<!-- Maven replaces the plugin-level <compilerArgs> with this one rather than -->
+								<!-- appending to it, so the lint flags above have to be repeated here, or the -->
+								<!-- test sources would compile with no lint at all. -->
+								<compilerArgs>
+									<arg>-Xlint:all</arg>
+									<arg>${javacLintSuppressions}</arg>
+									<!-- The "processing" lint lists every annotation in the sources that no -->
+									<!-- annotation processor claimed. The test sources are full of annotations -->
+									<!-- that are meant to be read reflectively and never processed (@Test and -->
+									<!-- the rest of JUnit, and the annotations the scanner tests scan for), so -->
+									<!-- on a JDK that runs the JMH processor over src/test/perf, javac lists -->
+									<!-- all of them and -Werror fails the build. Off for the test sources only: -->
+									<!-- the main sources keep the lint. -->
+									<arg>-Xlint:-processing</arg>
+									<arg>-Werror</arg>
+									<arg>-parameters</arg>
+								</compilerArgs>
+							</configuration>
+						</execution>
+					</executions>
+				</plugin>
+
+				<!-- Execute unit tests -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-surefire-plugin</artifactId>
+					<configuration>
+						<argLine>${surefireArgLine}</argLine>
+						<!-- Run the tests on the classpath, matching the test compile (see above) -->
+						<useModulePath>false</useModulePath>
+					</configuration>
+				</plugin>
+
+				<!-- Add src/test/perf to test sources -->
+				<plugin>
+					<groupId>org.codehaus.mojo</groupId>
+					<artifactId>build-helper-maven-plugin</artifactId>
+					<executions>
+						<execution>
+							<id>add-test-source</id>
+							<phase>generate-test-sources</phase>
+							<goals>
+								<goal>add-test-source</goal>
+							</goals>
+							<configuration>
+								<sources>
+									<source>src/test/perf</source>
+								</sources>
+							</configuration>
+						</execution>
+					</executions>
+				</plugin>
+
+				<!-- Create binary jar -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-jar-plugin</artifactId>
+					<configuration>
+						<forceCreation>true</forceCreation>
+						<archive>
+							<forced>true</forced>
+							<manifest>
+								<addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+								<addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
+							</manifest>
+							<manifestEntries>
+								<!-- Add OSGi bundle attributes to manifest -->
+								<Bundle-Category>Utilities</Bundle-Category>
+								<Bundle-License>http://opensource.org/licenses/MIT</Bundle-License>
+								<Bundle-ManifestVersion>2</Bundle-ManifestVersion>
+								<Bundle-Name>${osgiBundleName}</Bundle-Name>
+								<Bundle-SymbolicName>${project.groupId}.${project.artifactId}</Bundle-SymbolicName>
+								<Bundle-Vendor>Luke Hutchison</Bundle-Vendor>
+								<Bundle-Description>${project.description}</Bundle-Description>
+								<Bundle-Version>${project.version}</Bundle-Version>
+								<!-- Must match ${maven.compiler.release}: the jar contains Java 17 (major -->
+								<!-- version 61) bytecode, so declaring an older version here would let an OSGi -->
+								<!-- framework running on that version resolve this bundle, and then fail at -->
+								<!-- class load time. -->
+								<Require-Capability>osgi.ee;filter:="(&amp;(osgi.ee=JavaSE)(version=17))"</Require-Capability>
+								<Export-Package>${osgiExportPackage}</Export-Package>
+								<!-- Make sure "requires" entries in the module descriptor match these imports: -->
+								<!-- src/main/java/module-info.java -->
+								<Import-Package>${osgiImportPackage}</Import-Package>
+								<!-- The JBoss Modules equivalent of the "requires" clauses in -->
+								<!-- src/main/java/module-info.java. A JBoss Modules dependency is not visible to -->
+								<!-- modules that depend on this one unless it is marked "export", so every -->
+								<!-- "requires transitive" clause must be listed here with that modifier, and every -->
+								<!-- plain "requires" clause without it. "requires static" clauses are left out, -->
+								<!-- since the modules they name may not be installed in the container at all. -->
+								<Dependencies>${osgiDependencies}</Dependencies>
+							</manifestEntries>
+						</archive>
+					</configuration>
+				</plugin>
+
+				<!-- Create source jar -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-source-plugin</artifactId>
+					<executions>
+						<execution>
+							<id>attach-sources</id>
+							<phase>package</phase>
+							<goals>
+								<goal>jar-no-fork</goal>
+							</goals>
+						</execution>
+					</executions>
+				</plugin>
+
+				<!-- Create Javadoc jar. The settings that every Javadoc run shares are configured on the -->
+				<!-- plugin rather than on the execution, so that "javadoc:javadoc" and "javadoc:aggregate" -->
+				<!-- (below) are held to the same standard as the jar that is published. -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-javadoc-plugin</artifactId>
+					<configuration>
+						<source>17</source>
+						<doclint>all</doclint>
+						<excludePackageNames>*.internal:*.internal.*</excludePackageNames>
+						<show>public</show>
+						<!-- Without this, doclint reports missing or malformed Javadoc as a warning, and -->
+						<!-- the release still succeeds. -->
+						<failOnWarnings>true</failOnWarnings>
+						<!-- Switched off because the URL it generates is wrong. With it on, a signature that -->
+						<!-- names a type from another ClassGraph module is linked to that module's -->
+						<!-- ${project.url} + "/apidocs", i.e. to a path under the GitHub project page, where no -->
+						<!-- Javadoc is published; every such link 404s. Per-module Javadoc therefore renders -->
+						<!-- the names of types from the other modules as plain text. The aggregated Javadoc -->
+						<!-- (below) covers all five modules in one run, so there the links are correct by -->
+						<!-- construction, and that is what the documentation site should serve. -->
+						<detectOfflineLinks>false</detectOfflineLinks>
+					</configuration>
+					<executions>
+						<execution>
+							<id>attach-javadocs</id>
+							<phase>package</phase>
+							<goals>
+								<goal>jar</goal>
+							</goals>
+							<configuration>
+								<!-- Pin the Javadoc output dir to ${project.build.directory}/apidocs. Do not rely -->
+								<!-- on the plugin default: it changed in maven-javadoc-plugin 3.12.0 from -->
+								<!-- ${project.build.directory} to ${project.build.directory}/reports, which -->
+								<!-- silently broke copy-license-to-javadocs above (which hardcodes -->
+								<!-- ${project.build.directory}/apidocs) WITHOUT failing the build. If this -->
+								<!-- is ever changed, update that execution to match. -->
+								<outputDirectory>${project.build.directory}</outputDirectory>
+							</configuration>
+						</execution>
+
+						<!-- Run Javadoc a second time over everything the published run does not look at. The -->
+						<!-- settings above enable doclint and make its warnings fatal, but "show=public" and -->
+						<!-- the excluded internal packages mean it never sees a comment on a private, -->
+						<!-- package-private or protected member, nor any comment inside an internal package. -->
+						<!-- That is most of the codebase, and comments there went wrong unnoticed for years. -->
+						<!-- This execution looks at all of it. Its output is thrown away: it writes to its own -->
+						<!-- directory, and uses "javadoc-no-fork" rather than "jar", so it cannot disturb the -->
+						<!-- apidocs directory that attach-javadocs and copy-license-to-javadocs share, and -->
+						<!-- nothing it generates is published. -->
+						<!-- -->
+						<!-- Main sources only. The test sources are checked by doclint-tests below, which leaves -->
+						<!-- out the one doclint group that would be unreasonable to hold a test to. -->
+						<execution>
+							<id>doclint-everything</id>
+							<phase>package</phase>
+							<goals>
+								<goal>javadoc-no-fork</goal>
+							</goals>
+							<configuration>
+								<show>private</show>
+								<!-- Drop the internal-package exclusion that the plugin sets, so that this run -->
+								<!-- covers them too. An empty element on its own does not clear an inherited -->
+								<!-- value; combine.self="override" is what actually replaces it. -->
+								<excludePackageNames combine.self="override" />
+								<!-- Cover every source file, rather than every package the module exports. Left to -->
+								<!-- itself, the plugin hands Javadoc a generated list of the module's exported -->
+								<!-- packages, so a package that no "exports" clause names is never looked at. Several -->
+								<!-- of the internal packages of classgraph-vfs and classgraph-classpath are like this. -->
+								<!-- Naming the source files switches the plugin to listing those instead, which -->
+								<!-- reaches them. -->
+								<sourceFileIncludes>
+									<sourceFileInclude>**/*.java</sourceFileInclude>
+								</sourceFileIncludes>
+								<outputDirectory>${project.build.directory}/doclint-everything</outputDirectory>
+							</configuration>
+						</execution>
+						<!-- Check the test sources too, but with the "missing" group switched off. Held to the -->
+						<!-- same standard as the main sources, the test sources report over 800 warnings, and -->
+						<!-- almost every one is a test method carrying a one-line description and no tags, which -->
+						<!-- is fine for a test and generates no Javadoc for anyone to read. The rest of doclint -->
+						<!-- is a different matter: it catches a {@link} that does not resolve, a tag that is -->
+						<!-- malformed or names something that is not there, and broken HTML. The test sources -->
+						<!-- have none of those today, so this costs nothing to keep, and comments in tests have -->
+						<!-- gone wrong in exactly those ways before, found only by reading them. -->
+						<!-- Leaving "missing" out matters for a second reason: the test source roots take in -->
+						<!-- the JMH benchmark classes generated under target, which carry no Javadoc at all. -->
+						<execution>
+							<id>doclint-tests</id>
+							<phase>package</phase>
+							<goals>
+								<goal>test-javadoc-no-fork</goal>
+							</goals>
+							<configuration>
+								<show>private</show>
+								<doclint>all,-missing</doclint>
+								<excludePackageNames combine.self="override" />
+								<sourceFileIncludes>
+									<sourceFileInclude>**/*.java</sourceFileInclude>
+								</sourceFileIncludes>
+								<outputDirectory>${project.build.directory}/doclint-tests</outputDirectory>
+							</configuration>
+						</execution>
+					</executions>
+				</plugin>
+
+				<!-- Bump the version, commit, tag, and deploy the tag. Release with (under JDK 17): -->
+				<!--   export JAVA_HOME=/path/to/jdk17; export PATH="$JAVA_HOME/bin:$PATH" -->
+				<!--   ./mvnw -B -Prelease release:prepare -DdryRun=true   # dry run; then release:clean -->
+				<!--   ./mvnw -B -Prelease release:prepare                 # commits, tags, pushes -->
+				<!--   ./mvnw -B -Prelease release:perform                 # builds the tag, signs, publishes -->
+				<!-- -->
+				<!-- JAVA_HOME and PATH must both be *exported*, not just set for the ./mvnw command: -->
+				<!-- release:prepare forks a second Maven process, which resolves "java" from PATH, so a -->
+				<!-- one-shot "JAVA_HOME=... ./mvnw" builds the fork under whatever JDK is first on PATH. -->
+				<!-- If that is older than JDK 17, the requireJavaVersion enforcer rule fails. -->
+				<!-- -->
+				<!-- -B (batch mode) accepts the default release/tag/next-development versions, instead of -->
+				<!-- prompting for all three interactively. -->
+				<!-- -->
+				<!-- After a failed release:prepare, run "release:clean" AND "git checkout HEAD pom.xml" -->
+				<!-- before retrying; a left-over bumped version makes the retry fail for another reason. -->
+				<!-- -->
+				<!-- release:perform returns once the Central Portal has validated the uploaded bundle -->
+				<!-- (waitUntil defaults to VALIDATED; see the central-publishing-maven-plugin config, -->
+				<!-- above). Once the log line "Uploaded bundle successfully ... deploymentId: ..." has -->
+				<!-- appeared, publishing completes server-side, typically within 10 to 30 minutes; check -->
+				<!-- https://repo1.maven.org/maven2/io/github/classgraph/classgraph/<version>/ to confirm -->
+				<!-- the release is live. -->
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-release-plugin</artifactId>
+					<configuration>
+						<!-- Give every module the same version as the parent, so that the whole project -->
+						<!-- releases in lockstep. -->
+						<autoVersionSubmodules>true</autoVersionSubmodules>
+						<!-- Match the tag naming convention used by all existing tags -->
+						<tagNameFormat>classgraph-@{project.version}</tagNameFormat>
+						<!-- Activate the release profile (GPG signing) for the forked builds -->
+						<releaseProfiles>release</releaseProfiles>
+						<!-- Work around bug where releaseProfiles tag doesn't actually work yet -->
+						<arguments>-Prelease</arguments>
+					</configuration>
+				</plugin>
+			</plugins>
+		</pluginManagement>
+	</build>
+
+	<profiles>
+		<!-- Static null analysis. Error Prone 2.50.0 is compiled for JDK 21, and on JDK 21
+		     itself it rejects the build unless -XDaddTypeAnnotationsToSymbol=true is passed, so
+		     it can only run on JDK 22 and above. The CI matrix builds on every JDK from 17 (the
+		     minimum ClassGraph supports) to the latest release, and the null analysis is the
+		     same on every one of them, so it is simply skipped below JDK 22 rather than being
+		     version-matched. Deactivate it with -P '!nullcheck'. -->
+		<profile>
+			<id>nullcheck</id>
+			<activation>
+				<jdk>[22,)</jdk>
+			</activation>
+			<build>
+				<plugins>
+					<plugin>
+						<groupId>org.apache.maven.plugins</groupId>
+						<artifactId>maven-compiler-plugin</artifactId>
+						<executions>
+							<execution>
+								<id>default-compile</id>
+								<phase>compile</phase>
+								<goals>
+									<goal>compile</goal>
+								</goals>
+								<configuration>
+									<encoding>UTF-8</encoding>
+									<!-- Error Prone needs javac's own internals opened up to it (the -J flags -->
+									<!-- below), which requires forking the compiler. -->
+									<fork>true</fork>
+									<compilerArgs>
+										<arg>-Xlint:all</arg>             <!-- Max lint -->
+										<arg>${javacLintSuppressions}</arg>
+										<arg>-Werror</arg>
+										<!-- Static null analysis, to check the @NullMarked claim made by -->
+										<!-- module-info.java. NullAway runs as an Error Prone plugin, over the -->
+										<!-- main sources only: the test sources are deliberately unannotated. -->
+										<arg>-XDcompilePolicy=simple</arg>
+										<arg>-Xmaxerrs</arg>
+										<arg>10000</arg>
+										<arg>--should-stop=ifError=FLOW</arg>
+										<arg>-Xplugin:ErrorProne -XepDisableAllChecks -Xep:NullAway:ERROR -XepOpt:NullAway:AnnotatedPackages=io.github.classgraph -XepOpt:NullAway:JSpecifyMode=true</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED</arg>
+										<arg>-J--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED</arg>
+										<arg>-J--add-opens=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED</arg>
+										<arg>-J--add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED</arg>
+									</compilerArgs>
+									<annotationProcessorPaths>
+										<path>
+											<groupId>com.google.errorprone</groupId>
+											<artifactId>error_prone_core</artifactId>
+											<version>2.50.0</version>
+										</path>
+										<path>
+											<groupId>com.uber.nullaway</groupId>
+											<artifactId>nullaway</artifactId>
+											<version>0.13.8</version>
+										</path>
+									</annotationProcessorPaths>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+		<!-- Sign and publish jars for release. Activated automatically by maven-release-plugin (via -->
+		<!-- <releaseProfiles>/<arguments> above); pass -Prelease explicitly for a manual deploy. -->
+		<!-- The publishing plugin is scoped to this profile rather than declared in <build>, because -->
+		<!-- <extensions>true</extensions> forces Maven to resolve it at POM-read time on every build, -->
+		<!-- so a transient Maven Central outage would break "mvn test" for everyone, including CI. -->
+		<profile>
+			<id>release</id>
+			<build>
+				<plugins>
+					<!-- Deploy to Maven Central via the Central Portal (central.sonatype.com). -->
+					<!-- Requires a <server> with id "central" in settings.xml, containing a Portal user token. -->
+					<plugin>
+						<groupId>org.sonatype.central</groupId>
+						<artifactId>central-publishing-maven-plugin</artifactId>
+						<version>0.11.0</version>
+						<extensions>true</extensions>
+						<configuration>
+							<publishingServerId>central</publishingServerId>
+							<autoPublish>true</autoPublish>
+							<!-- waitUntil is deliberately left at its default, VALIDATED: release:perform returns -->
+							<!-- once the deployment passes validation, and autoPublish (above) then completes the -->
+							<!-- publication server-side. -->
+							<!-- Every module is uploaded in a single bundle, so the deployment is named after the -->
+							<!-- project as a whole rather than after whichever module happens to be last. -->
+							<deploymentName>${project.groupId}:classgraph:${project.version}</deploymentName>
+						</configuration>
+					</plugin>
+					<plugin>
+						<groupId>org.apache.maven.plugins</groupId>
+						<artifactId>maven-gpg-plugin</artifactId>
+						<configuration>
+							<gpgArguments>
+								<arg>--pinentry-mode</arg>
+								<arg>loopback</arg>
+							</gpgArguments>
+							<keyname>${gpg.keyname}</keyname>
+							<passphraseServerId>${gpg.keyname}</passphraseServerId>
+						</configuration>
+						<executions>
+							<execution>
+								<id>sign-artifacts</id>
+								<phase>verify</phase>
+								<goals>
+									<goal>sign</goal>
+								</goals>
+							</execution>
+						</executions>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+	</profiles>
+</project>

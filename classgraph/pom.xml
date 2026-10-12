@@ -1,0 +1,129 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<parent>
+		<groupId>io.github.classgraph</groupId>
+		<artifactId>classgraph-parent</artifactId>
+		<version>5.0.0-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>classgraph</artifactId>
+	<name>ClassGraph</name>
+
+	<description>The uber-fast, ultra-lightweight classpath and module scanner for JVM languages.</description>
+
+	<properties>
+		<!-- The shared files (the code formatter profile and the license) are one directory up -->
+		<rootDir>${project.basedir}/..</rootDir>
+
+		<osgiBundleName>ClassGraph</osgiBundleName>
+		<!-- Must list the same packages as the exports in src/main/java/module-info.java -->
+		<osgiExportPackage>io.github.classgraph;version="${project.version}"</osgiExportPackage>
+		<osgiImportPackage>io.github.classgraph.base,io.github.classgraph.base.internal.concurrency,io.github.classgraph.base.internal.filter,io.github.classgraph.base.internal.path,io.github.classgraph.base.internal.utils,io.github.classgraph.classpath,io.github.classgraph.classpath.internal,io.github.classgraph.vfs,io.github.classgraph.vfs.reader,org.jspecify.annotations;resolution:="optional"</osgiImportPackage>
+		<osgiDependencies>io.github.classgraph.classpath export</osgiDependencies>
+
+		<!-- This module has sources and produces a jar, so it needs the ecj checks and the license copies -->
+		<maven.antrun.skip>false</maven.antrun.skip>
+		<maven.resources.skip>false</maven.resources.skip>
+	</properties>
+
+	<!-- Versions are pinned in the parent's dependencyManagement section -->
+	<dependencies>
+		<dependency>
+			<groupId>${project.groupId}</groupId>
+			<artifactId>classgraph-classpath</artifactId>
+			<version>${project.version}</version>
+		</dependency>
+
+		<!-- Test dependencies: -->
+		<!-- Narcissus is an optional dependency of classgraph-base, so it is not inherited here. The tests that
+		     check what can be reached only with Narcissus installed need it on the test classpath. -->
+		<dependency>
+			<groupId>io.github.toolfactory</groupId>
+			<artifactId>narcissus</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.openjdk.jmh</groupId>
+			<artifactId>jmh-core</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.openjdk.jmh</groupId>
+			<artifactId>jmh-generator-annprocess</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>javax.enterprise</groupId>
+			<artifactId>cdi-api</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.ops4j.pax.url</groupId>
+			<artifactId>pax-url-aether</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-api</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-jdk14</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.hibernate.javax.persistence</groupId>
+			<artifactId>hibernate-jpa-2.1-api</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>com.google.jimfs</groupId>
+			<artifactId>jimfs</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>jakarta.validation</groupId>
+			<artifactId>jakarta.validation-api</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<executions>
+					<execution>
+						<!-- The benchmarks in src/test/perf are generated into runnable form by JMH's
+						     annotation processor, which writes the META-INF/BenchmarkList that
+						     org.openjdk.jmh.Main reads. Naming the processor explicitly is what makes that
+						     happen on every JDK: javac used to find it by scanning the test classpath, but
+						     JDK 23 turned that scan off by default, so on a current JDK the benchmarks were
+						     compiling to class files with no BenchmarkList beside them and could not be run.
+						     Naming it is also the only way to say this that every supported JDK understands:
+						     the -proc:full flag that turns discovery back on does not exist before JDK 21,
+						     whereas asking for a processor by name has always enabled processing.
+						     Only this module has benchmarks, so only this module needs the processor.
+						     Everything else about the execution, including the lint flags, is inherited from
+						     the same execution id in the parent pom. -->
+						<id>default-testCompile</id>
+						<configuration>
+							<annotationProcessors>
+								<annotationProcessor>org.openjdk.jmh.generators.BenchmarkProcessor</annotationProcessor>
+							</annotationProcessors>
+							<annotationProcessorPaths>
+								<path>
+									<groupId>org.openjdk.jmh</groupId>
+									<artifactId>jmh-generator-annprocess</artifactId>
+								</path>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+</project>

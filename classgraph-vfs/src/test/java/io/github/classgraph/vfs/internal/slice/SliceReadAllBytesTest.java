@@ -1,0 +1,135 @@
+package io.github.classgraph.vfs.internal.slice;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+import org.junit.jupiter.api.Test;
+
+/**
+ * Tests the reading of a resource into a byte array. The length of a deflated zip entry is only a hint, since it is
+ * read from the zipfile itself, so it can be wrong in either direction, and it can be a lie told by a zipfile that
+ * is trying to make the reader allocate more memory than it has.
+ */
+public class SliceReadAllBytesTest {
+    /** An {@link InputStream} that records whether it was closed. */
+    private static class ClosedRecordingInputStream extends ByteArrayInputStream {
+        /** True once this stream has been closed. */
+        boolean closed;
+
+        /**
+         * Constructor.
+         *
+         * @param content
+         *            the content of the stream
+         */
+        ClosedRecordingInputStream(final byte[] content) {
+            super(content);
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+    }
+
+    /**
+     * Content of the given length, with a different value every few bytes, so that content read in the wrong order
+     * or with a byte dropped does not still match.
+     *
+     * @param length
+     *            the length of the content
+     * @return the content
+     */
+    private static byte[] content(final int length) {
+        final var content = new byte[length];
+        for (var i = 0; i < length; i++) {
+            content[i] = (byte) (i * 31);
+        }
+        return content;
+    }
+
+    /**
+     * The whole stream is read whether its length is known, unknown, overstated or understated, since the length of
+     * a zip entry is only a hint.
+     *
+     * @throws IOException
+     *             if a stream could not be read
+     */
+    @Test
+    public void theWholeStreamIsReadWhateverItsLengthWasSaidToBe() throws IOException {
+        // A stream longer than the default buffer size, so that the buffer has to be grown when the length is not
+        // known in advance
+        final var content = content(100_000);
+
+        for (final long lengthHint : new long[] { -1L, 0L, 1L, content.length / 2, content.length,
+                content.length * 2L }) {
+            assertThat(Slice.readAllBytesAsArray(new ByteArrayInputStream(content), lengthHint))
+                    .as("length hint %d", lengthHint).containsExactly(content);
+        }
+    }
+
+    /**
+     * An empty stream is read as an empty array, rather than failing.
+     *
+     * @throws IOException
+     *             if a stream could not be read
+     */
+    @Test
+    public void anEmptyStreamIsReadAsAnEmptyArray() throws IOException {
+        assertThat(Slice.readAllBytesAsArray(new ByteArrayInputStream(new byte[0]), -1L)).isEmpty();
+        assertThat(Slice.readAllBytesAsArray(new ByteArrayInputStream(new byte[0]), 0L)).isEmpty();
+    }
+
+    /**
+     * The stream is closed once it has been read, so that reading a resource does not leak the handle it was read
+     * through.
+     *
+     * @throws IOException
+     *             if the stream could not be read
+     */
+    @Test
+    public void theStreamIsClosedOnceItHasBeenRead() throws IOException {
+        final var inputStream = new ClosedRecordingInputStream(content(16));
+        assertThat(Slice.readAllBytesAsArray(inputStream, 16L)).hasSize(16);
+        assertThat(inputStream.closed).isTrue();
+    }
+
+    /**
+     * A stream that returns zero from a read into a buffer with room left in it does not make the buffer grow,
+     * since the buffer is not full. If it grew on every such read, a few dozen of them would grow it to
+     * {@link Slice#MAX_BUFFER_SIZE} to hold a handful of bytes.
+     *
+     * @throws IOException
+     *             if the stream could not be read
+     */
+    @Test
+    public void aStreamThatReturnsZeroFromAReadDoesNotGrowTheBuffer() throws IOException {
+        final var content = content(64);
+        final var inputStream = new ByteArrayInputStream(content) {
+            /** Whether the next read of a non-empty range returns zero. */
+            private boolean returnZero = true;
+
+            @Override
+            public synchronized int read(final byte[] b, final int off, final int len) {
+                returnZero = !returnZero;
+                return len > 0 && !returnZero ? 0 : super.read(b, off, Math.min(len, 1));
+            }
+        };
+        assertThat(Slice.readAllBytesAsArray(inputStream, -1L)).containsExactly(content);
+    }
+
+    /**
+     * A length that is too large to fit in an array is rejected before the array is allocated, so that a zipfile
+     * cannot make the reader run out of memory just by claiming an entry is enormous.
+     */
+    @Test
+    public void aLengthThatIsTooLargeToFitInAnArrayIsRejected() {
+        assertThatThrownBy(
+                () -> Slice.readAllBytesAsArray(new ByteArrayInputStream(content(16)), Slice.MAX_BUFFER_SIZE + 1L))
+                .isInstanceOf(IOException.class).hasMessage("InputStream is too large to read");
+    }
+}
